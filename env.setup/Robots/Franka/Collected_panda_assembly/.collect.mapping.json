@@ -1,0 +1,11 @@
+{
+    "version": "1.0",
+    "file_records": [
+        {
+            "source_url": "omniverse://localhost/Library/sage/2025-10-02/robot/panda_assembly.usda",
+            "source_hash": "sha-256-flat;1048576;39c79901c238f1483e21f191a75f18e5f2abd2bbf36523a76326fec6b8e526fd",
+            "target_url": "./panda_assembly.usda",
+            "target_hash": "sha-256-flat;1048576;39c79901c238f1483e21f191a75f18e5f2abd2bbf36523a76326fec6b8e526fd"
+        }
+    ]
+}

@@ -1,0 +1,17 @@
+{
+  "dataset_root": "/home/alphatok/ME5400/expert_data",
+  "out_dir": "./checkpoints_bc_managed",
+  "batch_size": 32,
+  "num_workers": 4,
+  "lr_head": 0.001,
+  "lr_finetune": 0.0001,
+  "epochs": 50,
+  "freeze_epochs": 8,
+  "unfreeze_layer4": false,
+  "image_height": 240,
+  "image_width": 320,
+  "only_success": false,
+  "seed": 42,
+  "patience": 10,
+  "grad_clip": 1.0
+}

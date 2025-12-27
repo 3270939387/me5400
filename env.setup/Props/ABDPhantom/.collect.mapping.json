@@ -1,0 +1,17 @@
+{
+    "version": "1.0",
+    "file_records": [
+        {
+            "source_url": "omniverse://localhost/Library/sage/2025-10-02/phantom/phantom.usda",
+            "source_hash": "sha-256-flat;1048576;54dfd8f166f5ccf1857baf0d1eff05f0765f2dde472eade160e5c3a66da29121",
+            "target_url": "./phantom.usda",
+            "target_hash": "sha-256-flat;1048576;056deabfb3aeea9c8579802326238504d0b868c707b2a08b526802f74ccbba6a"
+        },
+        {
+            "source_url": "omniverse://localhost/Library/sage/2025-10-02/realsetup_latest/textures/sample_texture0.png",
+            "source_hash": "sha-256-flat;1048576;7a6ec4b5fdb82cbec76cdace1a76ac1d17b53690d10e863894bfc16d7ab4ffc3",
+            "target_url": "./SubUSDs/textures/sample_texture0.png",
+            "target_hash": "sha-256-flat;1048576;7a6ec4b5fdb82cbec76cdace1a76ac1d17b53690d10e863894bfc16d7ab4ffc3"
+        }
+    ]
+}
