@@ -1,0 +1,16 @@
+./venv/
+.venv/
+
+# 大文件（超过 GitHub 限制）
+env.setup/Robots/Franka/Collected_panda_assembly/panda_assembly.usda
+env.setup/Props/ABDPhantom/Organs/Bone.obj
+env.setup/Props/ABDPhantom/Organs/Skin.obj
+
+# 数据集（通常很大，不应该提交到 Git）
+expert_data/
+DATA/
+DATA2/
+*.pt
+*.pth
+checkpoints_bc_managed/
+evaluation_results/
