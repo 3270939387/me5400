@@ -13,4 +13,7 @@ DATA2/
 *.pt
 *.pth
 checkpoints_bc_managed/
+
+# 评估结果（独立文件夹）
+evaluation/
 evaluation_results/

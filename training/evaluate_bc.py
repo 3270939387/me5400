@@ -19,6 +19,7 @@ simulation_app = SimulationApp({"headless": False})
 import os
 import sys
 import time
+import json
 import argparse
 import numpy as np
 import torch
@@ -33,6 +34,7 @@ from pxr import UsdPhysics, Gf, Usd
 
 # 核心模块
 from omni.isaac.core import SimulationContext
+from omni.isaac.core.utils.types import ArticulationAction
 from isaacsim.core.prims import SingleArticulation as Articulation
 from isaacsim.core.prims import SingleXFormPrim as XFormPrim
 from omni.kit.viewport.utility import get_active_viewport, capture_viewport_to_file
@@ -79,6 +81,12 @@ PANDA_JOINT_LIMITS = [
     (-2.8973, 2.8973),   # joint7
 ]
 
+# 工作空间定义（与数据收集时一致）
+WORKSPACE_CENTER = np.array([0.0, 0.50, 0.50])  # 米
+WORKSPACE_RADIUS = 0.25  # 米（25cm）
+WORKSPACE_Z_MIN = 0.20  # 米
+WORKSPACE_Z_MAX = 0.75  # 米
+
 # 成功条件（与数据收集时一致）
 SUCCESS_DISTANCE_X_MAX = 0.1   # 米
 SUCCESS_DISTANCE_Y_MAX = 0.1   # 米
@@ -108,7 +116,7 @@ class ViewportCamera:
             return False
 
 def sample_random_joint_config(num_joints):
-    """随机采样关节配置"""
+    """在关节限位内随机采样关节配置"""
     random_joint_positions = []
     for i in range(num_joints):
         if i < len(PANDA_JOINT_LIMITS):
@@ -117,6 +125,104 @@ def sample_random_joint_config(num_joints):
         else:
             random_joint_positions.append(np.random.uniform(-np.pi, np.pi))
     return np.array(random_joint_positions, dtype=np.float32)
+
+def check_workspace_constraint(ee_pos_base):
+    """
+    检查末端执行器位置是否在工作空间内
+    ee_pos_base: 末端执行器在 Panda base 坐标系下的位置 (x, y, z)
+    返回: (is_valid, reason)
+    """
+    # 1. 检查球约束：||p_ee - center|| <= radius
+    offset = ee_pos_base - WORKSPACE_CENTER
+    distance = np.linalg.norm(offset)
+    if distance > WORKSPACE_RADIUS:
+        return False, f"超出球半径: {distance:.3f}m > {WORKSPACE_RADIUS}m"
+    
+    # 2. 检查Z范围约束：z_min <= z <= z_max
+    z = ee_pos_base[2]
+    if z < WORKSPACE_Z_MIN:
+        return False, f"Z过低: {z:.3f}m < {WORKSPACE_Z_MIN}m"
+    if z > WORKSPACE_Z_MAX:
+        return False, f"Z过高: {z:.3f}m > {WORKSPACE_Z_MAX}m"
+    
+    return True, "OK"
+
+def sample_valid_initial_config(robot, sim, max_attempts=100):
+    """
+    使用拒绝采样找到工作空间内的有效初始配置（与数据收集时一致）
+    返回: (joint_positions, ee_pos_base) 或 (None, None) 如果失败
+    """
+    # 获取 Panda base 的世界变换
+    base_quat = None
+    base_pos = None
+    
+    try:
+        base_prim = XFormPrim("/World/Panda")
+        base_world_pos, base_world_orn = base_prim.get_world_pose()
+        
+        # 确保转换为 Python float
+        base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
+        base_orn = [float(base_world_orn[0]), float(base_world_orn[1]), float(base_world_orn[2]), float(base_world_orn[3])]
+        
+        # 使用 Gf 库处理四元数和旋转
+        base_quat = Gf.Quatd(float(base_orn[0]), Gf.Vec3d(float(base_orn[1]), float(base_orn[2]), float(base_orn[3])))
+        
+    except Exception as e:
+        # 简化方法：只考虑平移
+        try:
+            base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
+        except:
+            base_pos = [0.0, 0.0, 0.0]
+        base_quat = None
+    
+    # 构建从world到base的变换
+    def world_to_base(p_world):
+        p_world = np.array([float(p_world[0]), float(p_world[1]), float(p_world[2])], dtype=float)
+        p_rel = Gf.Vec3d(p_world[0] - float(base_pos[0]),
+                         p_world[1] - float(base_pos[1]),
+                         p_world[2] - float(base_pos[2]))
+        
+        if base_quat is None:
+            return np.array([float(p_rel[0]), float(p_rel[1]), float(p_rel[2])], dtype=float)
+        
+        q_inv = base_quat.GetInverse()
+        p_base = q_inv.Transform(p_rel)
+        return np.array([float(p_base[0]), float(p_base[1]), float(p_base[2])], dtype=float)
+    
+    num_joints = robot.num_dof
+    
+    for attempt in range(max_attempts):
+        # 1. 随机采样关节配置
+        joint_positions = sample_random_joint_config(num_joints)
+        
+        # 2. 设置关节位置（先重置速度，避免突然变化）
+        robot.set_joint_velocities(np.zeros(num_joints))
+        robot.set_joint_positions(joint_positions)
+        
+        # 3. 推进更多帧让物理稳定
+        for _ in range(10):
+            sim.step(render=False)
+        
+        # 4. 获取TCP的世界坐标
+        try:
+            tcp_prim = XFormPrim(TCP_PATH)
+            tcp_world_pos, _ = tcp_prim.get_world_pose()
+        except Exception as e:
+            continue
+        
+        # 5. 转换到base坐标系
+        tcp_base_pos = world_to_base(tcp_world_pos)
+        
+        # 6. 检查工作空间约束
+        is_valid, reason = check_workspace_constraint(tcp_base_pos)
+        
+        if is_valid:
+            return joint_positions, tcp_base_pos
+        else:
+            if attempt < 5 or attempt % 20 == 0:
+                pass  # 评估时不需要打印太多信息
+    
+    return None, None
 
 def load_model(checkpoint_path, device):
     """加载训练好的模型"""
@@ -159,12 +265,17 @@ def check_success(ee_pos, marker_pos):
 # ===================== 主函数 =====================
 
 def main():
+    # 获取项目根目录（evaluate_bc.py 在 training/ 目录下）
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)  # 项目根目录
+    default_output_dir = os.path.join(project_root, "evaluation")
+    
     parser = argparse.ArgumentParser(description="BC模型评估脚本")
     parser.add_argument("--checkpoint", type=str, required=True, help="模型checkpoint路径")
     parser.add_argument("--num_episodes", type=int, default=20, help="评估episode数量")
     parser.add_argument("--steps_per_episode", type=int, default=200, help="每个episode的最大步数")
     parser.add_argument("--save_images", action="store_true", help="是否保存评估过程中的图像")
-    parser.add_argument("--output_dir", type=str, default="./evaluation_results", help="输出目录")
+    parser.add_argument("--output_dir", type=str, default=default_output_dir, help="输出目录（默认: <project_root>/evaluation）")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -261,10 +372,22 @@ def main():
         print(f"Episode {episode_idx + 1}/{args.num_episodes}")
         print(f"{'='*60}")
 
-        # 随机初始配置
-        random_joint_positions = sample_random_joint_config(robot.num_dof)
-        robot.set_joint_velocities(np.zeros(robot.num_dof))
-        robot.set_joint_positions(random_joint_positions)
+        # 为每个 episode 创建独立的子文件夹
+        episode_output_dir = os.path.join(args.output_dir, f"episode_{episode_idx:02d}")
+        os.makedirs(episode_output_dir, exist_ok=True)
+
+        # 使用拒绝采样找到工作空间内的有效初始配置（与数据收集时一致）
+        random_joint_positions, ee_pos_base = sample_valid_initial_config(robot, sim, max_attempts=100)
+        
+        if random_joint_positions is None:
+            print(f"   ⚠️ 无法找到有效配置，使用随机配置（可能不在工作空间内）")
+            random_joint_positions = sample_random_joint_config(robot.num_dof)
+            robot.set_joint_velocities(np.zeros(robot.num_dof))
+            robot.set_joint_positions(random_joint_positions)
+        else:
+            # 配置已设置，只需确保位置正确
+            robot.set_joint_velocities(np.zeros(robot.num_dof))
+            robot.set_joint_positions(random_joint_positions)
         
         # 物理稳定
         for _ in range(30):
@@ -280,59 +403,98 @@ def main():
             if not simulation_app.is_running():
                 break
 
-            # 1. 捕获图像
-            temp_img_path = os.path.join(args.output_dir, "temp_frame.png")
-            if not cam.capture(temp_img_path):
-                print(f"   ⚠️ 第 {step} 步截图失败")
-                continue
-
-            # 等待文件写入完成（capture_viewport_to_file可能是异步的）
-            max_wait_attempts = 10
-            wait_attempt = 0
-            while wait_attempt < max_wait_attempts:
-                if os.path.exists(temp_img_path):
-                    # 检查文件大小，确保不是空文件
-                    file_size = os.path.getsize(temp_img_path)
-                    if file_size > 0:
-                        # 再等待一小段时间，确保文件完全写入
-                        time.sleep(0.05)
-                        break
-                time.sleep(0.05)
-                wait_attempt += 1
+            # 1. 捕获图像（保存到该 episode 的子文件夹中）
+            temp_img_path = os.path.join(episode_output_dir, f"frame_{step:04d}.png")
+            image_tensor = None
+            max_capture_retries = 2  # 减少重试次数，因为文件名已不同
             
-            if wait_attempt >= max_wait_attempts or not os.path.exists(temp_img_path):
-                print(f"   ⚠️ 第 {step} 步图像文件未生成或为空")
-                continue
+            for capture_retry in range(max_capture_retries):
+                # 强制渲染更新（确保 viewport 已渲染）
+                simulation_app.update()
+                
+                # 捕获图像
+                if not cam.capture(temp_img_path):
+                    if capture_retry < max_capture_retries - 1:
+                        simulation_app.update()
+                        time.sleep(0.05)
+                        continue
+                    else:
+                        print(f"   ⚠️ 第 {step} 步截图失败（已重试 {max_capture_retries} 次）")
+                        break
 
-            # 2. 预处理图像
-            try:
-                # 尝试打开图像，如果失败会抛出异常
-                image = Image.open(temp_img_path).convert('RGB')
-                # 尝试加载图像数据，确保文件完整
-                image.load()  # 这会强制加载所有数据，如果文件损坏会抛出异常
-                image_tensor = transform(image).unsqueeze(0).to(device)  # [1, 3, H, W]
-            except Exception as e:
-                print(f"   ⚠️ 图像加载失败: {e}")
-                continue
+                # 强制刷新（确保文件写入开始）
+                simulation_app.update()
+                
+                # 等待文件写入完成（简化逻辑：只要文件大小 > 最小阈值即可）
+                min_bytes = 10_000  # 最小文件大小阈值（1280x720 PNG 一般远大于这个）
+                max_wait_attempts = 20
+                wait_attempt = 0
+                file_ready = False
+                
+                while wait_attempt < max_wait_attempts:
+                    if os.path.exists(temp_img_path):
+                        file_size = os.path.getsize(temp_img_path)
+                        if file_size >= min_bytes:
+                            file_ready = True
+                            break
+                    simulation_app.update()  # 每次检查时也更新
+                    time.sleep(0.05)
+                    wait_attempt += 1
+                
+                if not file_ready:
+                    if capture_retry < max_capture_retries - 1:
+                        simulation_app.update()
+                        time.sleep(0.05)
+                        continue
+                    else:
+                        print(f"   ⚠️ 第 {step} 步图像文件未就绪（已重试 {max_capture_retries} 次）")
+                        break
+
+                # 2. 预处理图像
+                try:
+                    # 尝试打开图像
+                    image = Image.open(temp_img_path).convert('RGB')
+                    # 验证图像完整性
+                    image.verify()  # 验证但不加载数据
+                    image = Image.open(temp_img_path).convert('RGB')  # 重新打开以加载数据
+                    image_tensor = transform(image).unsqueeze(0).to(device)  # [1, 3, H, W]
+                    break  # 成功加载，退出重试循环
+                except Exception as e:
+                    if capture_retry < max_capture_retries - 1:
+                        simulation_app.update()
+                        time.sleep(0.05)
+                        continue
+                    else:
+                        print(f"   ⚠️ 图像加载失败: {e}（已重试 {max_capture_retries} 次）")
+                        break
+            
+            if image_tensor is None:
+                continue  # 跳过这一步，继续下一步
 
             # 3. 模型预测
             with torch.no_grad():
                 delta_q_pred = model(image_tensor).cpu().numpy()[0]  # [7]
 
-            # 4. 应用动作（delta_q -> 关节速度控制）
-            # 使用简单的速度控制：将delta_q转换为速度命令
+            # 4. 应用动作（delta_q -> 目标关节位置）
+            # 将 delta_q 转换为目标关节位置（更符合 BC 训练的语义）
             q_current = robot.get_joint_positions()
             
-            # 将delta_q转换为速度（带缩放因子，避免过大速度）
-            max_velocity = 2.0  # rad/s，最大关节速度
-            velocity_scale = 10.0  # 将delta_q转换为速度的缩放因子
-            target_velocity = np.clip(delta_q_pred * velocity_scale, -max_velocity, max_velocity)
+            # 计算目标关节位置：q_target = q_current + delta_q
+            q_target = q_current + delta_q_pred
             
-            # 应用速度命令
-            robot.set_joint_velocities(target_velocity)
+            # 限制在关节限位内（避免超出物理限制）
+            for i in range(len(q_target)):
+                if i < len(PANDA_JOINT_LIMITS):
+                    lower, upper = PANDA_JOINT_LIMITS[i]
+                    q_target[i] = np.clip(q_target[i], lower, upper)
+            
+            # 使用 apply_action 应用目标位置（与数据收集时一致，更可靠）
+            action = ArticulationAction(joint_positions=q_target)
+            robot.apply_action(action)
 
             # 5. 推进仿真
             sim.step(render=True)
+            simulation_app.update()  # 确保渲染更新
 
             # 6. 检查碰撞
             dq_after_step = robot.get_joint_velocities()
@@ -380,12 +542,18 @@ def main():
         else:
             results["timeout"] += 1
 
-        results["episode_details"].append({
+        episode_result = {
             "episode": episode_idx,
             "success": episode_success,
             "end_reason": end_reason,
             "end_step": step
-        })
+        }
+        results["episode_details"].append(episode_result)
+
+        # 保存该 episode 的单独结果文件
+        episode_result_file = os.path.join(episode_output_dir, "episode_result.json")
+        with open(episode_result_file, "w") as f:
+            json.dump(episode_result, f, indent=2)
 
         status_emoji = "✅" if episode_success else "❌"
         print(f"{status_emoji} Episode {episode_idx} 完成: {end_reason}")
@@ -400,8 +568,7 @@ def main():
     print(f"超时: {results['timeout']} ({results['timeout']/args.num_episodes*100:.1f}%)")
     print(f"{'='*60}")
 
-    # 保存结果
-    import json
+    # 保存总体结果
     results_file = os.path.join(args.output_dir, "evaluation_results.json")
     with open(results_file, "w") as f:
         json.dump(results, f, indent=2)
