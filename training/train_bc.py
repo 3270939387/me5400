@@ -285,6 +285,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--resume", type=str, default=None, help="从checkpoint继续训练（例如: ./checkpoints_bc_managed/best.pt）")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -309,6 +310,19 @@ def main():
 
     # Model
     model = ResNetMLPPolicy(out_dim=7).to(device)
+    
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if args.resume:
+        if os.path.exists(args.resume):
+            print(f"📂 从checkpoint恢复: {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=device)
+            model.load_state_dict(checkpoint['model'])
+            start_epoch = checkpoint.get('epoch', 0) + 1  # 从下一个epoch开始
+            print(f"   已加载epoch {checkpoint.get('epoch', 0)}的模型")
+            print(f"   验证MSE: {checkpoint.get('val_mse', 'N/A')}")
+        else:
+            print(f"⚠️ 警告: checkpoint文件不存在: {args.resume}，将从头开始训练")
 
     # Phase 1: freeze backbone, train head
     freeze_backbone(model, freeze=True)
@@ -320,18 +334,27 @@ def main():
     # Logging
     metrics_csv = os.path.join(args.out_dir, "metrics.csv")
     metrics_jsonl = os.path.join(args.out_dir, "metrics.jsonl")
-    with open(metrics_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "epoch", "phase", "train_loss",
-            "val_mse", "val_cos", "val_norm_gt", "val_norm_pred",
-            "lr"
-        ] + [f"val_rmse_j{i+1}" for i in range(7)])
-    # also dump config
+    
+    # 如果resume，追加模式；否则覆盖模式（写入表头）
+    if not args.resume or start_epoch == 0:
+        with open(metrics_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "epoch", "phase", "train_loss",
+                "val_mse", "val_cos", "val_norm_gt", "val_norm_pred",
+                "lr"
+            ] + [f"val_rmse_j{i+1}" for i in range(7)])
+    # also dump config (always overwrite)
     with open(os.path.join(args.out_dir, "run_args.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    best_val = float("inf")
+    # 如果resume，从checkpoint中恢复best_val；否则初始化为inf
+    if args.resume and os.path.exists(args.resume):
+        checkpoint = torch.load(args.resume, map_location=device)
+        best_val = checkpoint.get('val_mse', float("inf"))
+        print(f"   当前最佳验证MSE: {best_val:.6f}")
+    else:
+        best_val = float("inf")
     best_path = os.path.join(args.out_dir, "best.pt")
 
     # store history for plotting
@@ -349,7 +372,7 @@ def main():
 
     start_time = time.time()
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         # switch phase
         if epoch < args.freeze_epochs:
             phase = "head_only"

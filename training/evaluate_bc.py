@@ -403,6 +403,11 @@ def main():
             if not simulation_app.is_running():
                 break
 
+            # 显示进度（每10步显示一次，或最后一步）
+            if step % 10 == 0 or step == args.steps_per_episode - 1:
+                progress_pct = (step + 1) / args.steps_per_episode * 100
+                print(f"   步数: {step + 1}/{args.steps_per_episode} ({progress_pct:.1f}%)", end="\r", flush=True)
+
             # 1. 捕获图像（保存到该 episode 的子文件夹中）
             temp_img_path = os.path.join(episode_output_dir, f"frame_{step:04d}.png")
             image_tensor = None
@@ -503,7 +508,7 @@ def main():
             if max_velocity > COLLISION_VELOCITY_THRESHOLD:
                 has_collision = True
                 end_reason = "collision"
-                print(f"   ⚠️ 第 {step} 步检测到碰撞（速度异常: {max_velocity:.2f} rad/s）")
+                print(f"\n   ⚠️ 第 {step + 1} 步检测到碰撞（速度异常: {max_velocity:.2f} rad/s）")
                 break
 
             if prev_dq is not None:
@@ -512,7 +517,7 @@ def main():
                 if max_acceleration > COLLISION_ACCELERATION_THRESHOLD:
                     has_collision = True
                     end_reason = "collision"
-                    print(f"   ⚠️ 第 {step} 步检测到碰撞（加速度异常: {max_acceleration:.2f} rad/s²）")
+                    print(f"\n   ⚠️ 第 {step + 1} 步检测到碰撞（加速度异常: {max_acceleration:.2f} rad/s²）")
                     break
 
             prev_dq = dq_after_step.copy()
@@ -529,7 +534,7 @@ def main():
                     diff_x = abs(tcp_pos[0] - marker_pos[0])
                     diff_y = abs(tcp_pos[1] - marker_pos[1])
                     diff_z = abs(tcp_pos[2] - marker_pos[2])
-                    print(f"   ✅ 第 {step} 步成功到达目标！(X={diff_x:.3f}m, Y={diff_y:.3f}m, Z={diff_z:.3f}m)")
+                    print(f"\n   ✅ 第 {step + 1} 步成功到达目标！(X={diff_x:.3f}m, Y={diff_y:.3f}m, Z={diff_z:.3f}m)")
                     break
             except Exception as e:
                 print(f"   ⚠️ 无法获取TCP位置: {e}")
@@ -555,8 +560,11 @@ def main():
         with open(episode_result_file, "w") as f:
             json.dump(episode_result, f, indent=2)
 
+        # 清除进度显示行
+        print(" " * 50, end="\r")  # 清除进度行
+        
         status_emoji = "✅" if episode_success else "❌"
-        print(f"{status_emoji} Episode {episode_idx} 完成: {end_reason}")
+        print(f"{status_emoji} Episode {episode_idx} 完成: {end_reason} (共 {step + 1} 步)")
 
     # --- 4. 打印统计结果 ---
     print(f"\n{'='*60}")
