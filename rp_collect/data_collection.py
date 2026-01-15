@@ -27,7 +27,7 @@ from omni.kit.viewport.utility import get_active_viewport, capture_viewport_to_f
 
 # ===================== ⚙️ 数据集配置 =====================
 # ⚠️ 再次确认路径正确
-ENV_USD_PATH = "/home/alphatok/ME5400/env.setup/env.usda"
+ENV_USD_PATH = "/home/wopubuntu/me5400/env.setup/env.usda"
 MARKER_PATH = "/World/Phantom/marker"
 ROBOT_PATH = "/World/Panda"
 PHANTOM_PATH = "/World/Phantom"
@@ -35,13 +35,15 @@ TABLE_PATH = "/World/Table"
 CAM_PATH = "/World/Panda/D405_rigid/D405/Camera_OmniVision_OV9782_Color"
 
 # 输出根目录
-DATASET_ROOT = "/home/alphatok/ME5400/DATA2"
+DATASET_ROOT = "/home/wopubuntu/me5400/rp_collect/DATA"
 
 # 采集参数
-NUM_EPISODES = 200        # 总共采集多少集（从100增加到200）
+NUM_EPISODES = 500        # 总共采集多少集（从100增加到200）
 STEPS_PER_EPISODE = 200   # 每一集跑多少步
 DT = 1.0 / 60.0
-CAPTURE_EVERY_N = 3       # 每3步保存一次（从5改为3，提升采样密度）
+CAPTURE_EVERY_N_DEFAULT = 5  # 默认每3步保存一次
+CAPTURE_EVERY_N_CLOSE = 3    # 距离小于0.3m时每2步保存一次
+threshold_distance_close = 0.3  # 米
 TARGET_OFFSET = [0.52, -0.07, -0.65]
 
 # 随机化参数：Panda 关节限制（用于在工作空间内随机采样）
@@ -60,28 +62,6 @@ WORKSPACE_CENTER = np.array([0.0, 0.50, 0.50])  # 米
 WORKSPACE_RADIUS = 0.30  # 米（30cm，从25cm扩大）
 WORKSPACE_Z_MIN = 0.15  # 米（从0.20降低）
 WORKSPACE_Z_MAX = 0.80  # 米（从0.75增加）
-
-# 初始配置多样性参数（三种桶混合采样）
-# 按专家建议的分配：
-# - 80集（40%）：中等偏离纠偏（Bucket B）- marker在图像边缘/偏离中心明显
-# - 80集（40%）：正常分布（random）- 当前workspace随机采样
-# - 40集（20%）：near-marker微调（Bucket A）- 起始就在marker附近
-# Bucket C（Hard cases）在正常分布中随机选择一部分实现
-BUCKET_A_RATIO = 0.20  # 近处微调（20% = 40集）
-BUCKET_B_RATIO = 0.40  # 中等偏离纠偏（40% = 80集）
-BUCKET_C_RATIO = 0.20  # Hard cases（在正常分布中随机选择20%）
-
-# Bucket A 参数
-NEAR_TARGET_DISTANCE_MIN = 0.10  # 米，距离目标的最小距离
-NEAR_TARGET_DISTANCE_MAX = 0.20  # 米，距离目标的最大距离
-
-# Bucket B 参数（中等偏离）
-MEDIUM_OFFSET_DISTANCE_MIN = 0.20  # 米，中等偏离的最小距离
-MEDIUM_OFFSET_DISTANCE_MAX = 0.35  # 米，中等偏离的最大距离
-
-# Bucket C 参数（Hard cases）
-HARD_CASE_OFFSET_MIN = 0.15  # 米
-HARD_CASE_OFFSET_MAX = 0.30  # 米
 
 # ===================== 辅助类 =====================
 class ViewportCamera:
@@ -275,377 +255,6 @@ def sample_valid_initial_config(robot, sim, max_attempts=100):
     print(f"   ❌ 在 {max_attempts} 次尝试后未找到有效配置")
     return None, None
 
-def sample_near_target_config(robot, sim, target_world_pos, world_to_base_func, max_attempts=100):
-    """
-    在目标附近采样初始配置（用于增加数据多样性）
-    
-    Args:
-        robot: 机器人对象
-        sim: 仿真上下文
-        target_world_pos: 目标的世界坐标（marker位置）
-        world_to_base_func: world到base坐标系的转换函数
-        max_attempts: 最大尝试次数
-    
-    Returns:
-        (joint_positions, ee_pos_base) 或 (None, None) 如果失败
-    """
-    num_joints = robot.num_dof
-    
-    # 将目标位置转换到base坐标系
-    target_base_pos = world_to_base_func(target_world_pos)
-    
-    for attempt in range(max_attempts):
-        # 1. 在目标附近随机采样一个位置（球壳采样）
-        # 距离目标 NEAR_TARGET_DISTANCE_MIN 到 NEAR_TARGET_DISTANCE_MAX 之间
-        distance = np.random.uniform(NEAR_TARGET_DISTANCE_MIN, NEAR_TARGET_DISTANCE_MAX)
-        
-        # 随机方向（单位向量）
-        direction = np.random.uniform(-1, 1, 3)
-        direction = direction / (np.linalg.norm(direction) + 1e-8)
-        
-        # 目标附近的期望位置（在base坐标系）
-        desired_ee_base_pos = target_base_pos + direction * distance
-        
-        # 2. 检查是否在工作空间内
-        is_valid, reason = check_workspace_constraint(desired_ee_base_pos)
-        if not is_valid:
-            if attempt < 5 or attempt % 20 == 0:
-                print(f"   ⏳ 目标附近采样尝试 {attempt+1}/{max_attempts}: {reason}")
-            continue
-        
-        # 3. 使用逆运动学找到对应的关节配置
-        # 由于没有直接的IK求解器，我们使用随机采样+最近邻搜索
-        # 尝试多个随机配置，找到最接近期望位置的配置
-        best_config = None
-        best_distance = float('inf')
-        
-        # 先尝试一个基础配置（用于增加姿态多样性）
-        base_config = sample_random_joint_config(num_joints)
-        
-        for ik_attempt in range(50):  # 尝试50次找到接近的配置
-            # 在基础配置附近采样（增加姿态多样性）
-            if ik_attempt < 20:
-                # 前20次：在基础配置附近采样（不同姿态）
-                joint_positions = sample_random_joint_config(num_joints, base_config, variation_scale=0.5)
-            else:
-                # 后30次：完全随机采样
-                joint_positions = sample_random_joint_config(num_joints)
-            
-            # 设置关节位置
-            robot.set_joint_velocities(np.zeros(num_joints))
-            robot.set_joint_positions(joint_positions)
-            
-            # 物理稳定
-            for _ in range(10):
-                sim.step(render=False)
-            
-            # 获取TCP位置
-            try:
-                tcp_prim = XFormPrim("/World/Panda/TCP")
-                tcp_world_pos, _ = tcp_prim.get_world_pose()
-                tcp_base_pos = world_to_base_func(tcp_world_pos)
-                
-                # 计算到期望位置的距离
-                dist = np.linalg.norm(tcp_base_pos - desired_ee_base_pos)
-                
-                if dist < best_distance:
-                    best_distance = dist
-                    best_config = joint_positions.copy()
-                    
-                    # 如果足够接近（5cm内），直接返回
-                    if dist < 0.05:
-                        return joint_positions, tcp_base_pos
-            except:
-                continue
-        
-        # 如果找到了比较接近的配置（10cm内），使用它
-        if best_config is not None and best_distance < 0.10:
-            robot.set_joint_velocities(np.zeros(num_joints))
-            robot.set_joint_positions(best_config)
-            for _ in range(10):
-                sim.step(render=False)
-            try:
-                tcp_prim = XFormPrim("/World/Panda/TCP")
-                tcp_world_pos, _ = tcp_prim.get_world_pose()
-                tcp_base_pos = world_to_base_func(tcp_world_pos)
-                return best_config, tcp_base_pos
-            except:
-                continue
-    
-    return None, None
-
-def sample_medium_offset_config(robot, sim, marker_world_pos, world_to_base_func, max_attempts=100):
-    """
-    Bucket B: 中等偏离纠偏 - marker在图像边缘/偏离中心明显
-    
-    Args:
-        robot: 机器人对象
-        sim: 仿真上下文
-        marker_world_pos: marker的世界坐标
-        world_to_base_func: world到base坐标系的转换函数
-        max_attempts: 最大尝试次数
-    
-    Returns:
-        (joint_positions, ee_pos_base) 或 (None, None) 如果失败
-    """
-    num_joints = robot.num_dof
-    target_base_pos = world_to_base_func(marker_world_pos)
-    
-    for attempt in range(max_attempts):
-        # 在中等距离（20-35cm）采样，让marker在图像边缘/偏离中心
-        distance = np.random.uniform(MEDIUM_OFFSET_DISTANCE_MIN, MEDIUM_OFFSET_DISTANCE_MAX)
-        direction = np.random.uniform(-1, 1, 3)
-        direction = direction / (np.linalg.norm(direction) + 1e-8)
-        desired_ee_base_pos = target_base_pos + direction * distance
-        
-        is_valid, reason = check_workspace_constraint(desired_ee_base_pos)
-        if not is_valid:
-            if attempt < 5 or attempt % 20 == 0:
-                print(f"   ⏳ 中等偏离采样尝试 {attempt+1}/{max_attempts}: {reason}")
-            continue
-        
-        # 使用随机采样+最近邻搜索
-        best_config = None
-        best_distance = float('inf')
-        base_config = sample_random_joint_config(num_joints)
-        
-        for ik_attempt in range(50):
-            if ik_attempt < 20:
-                joint_positions = sample_random_joint_config(num_joints, base_config, variation_scale=0.5)
-            else:
-                joint_positions = sample_random_joint_config(num_joints)
-            
-            robot.set_joint_velocities(np.zeros(num_joints))
-            robot.set_joint_positions(joint_positions)
-            for _ in range(10):
-                sim.step(render=False)
-            
-            try:
-                tcp_prim = XFormPrim("/World/Panda/TCP")
-                tcp_world_pos, _ = tcp_prim.get_world_pose()
-                tcp_base_pos = world_to_base_func(tcp_world_pos)
-                dist = np.linalg.norm(tcp_base_pos - desired_ee_base_pos)
-                
-                if dist < best_distance:
-                    best_distance = dist
-                    best_config = joint_positions.copy()
-                    if dist < 0.05:
-                        return joint_positions, tcp_base_pos
-            except:
-                continue
-        
-        if best_config is not None and best_distance < 0.10:
-            robot.set_joint_velocities(np.zeros(num_joints))
-            robot.set_joint_positions(best_config)
-            for _ in range(10):
-                sim.step(render=False)
-            try:
-                tcp_prim = XFormPrim("/World/Panda/TCP")
-                tcp_world_pos, _ = tcp_prim.get_world_pose()
-                tcp_base_pos = world_to_base_func(tcp_world_pos)
-                return best_config, tcp_base_pos
-            except:
-                continue
-    
-    return None, None
-
-def sample_hard_case_config(robot, sim, marker_world_pos, world_to_base_func, max_attempts=100):
-    """
-    Bucket C: Hard cases - 容易经过桌面/phantom边缘、容易遮挡marker
-    
-    策略：在目标的一侧采样，让路径容易经过障碍物
-    """
-    num_joints = robot.num_dof
-    target_base_pos = world_to_base_func(marker_world_pos)
-    
-    for attempt in range(max_attempts):
-        # 在目标的一侧采样（不是均匀球壳，而是偏向某个方向）
-        distance = np.random.uniform(HARD_CASE_OFFSET_MIN, HARD_CASE_OFFSET_MAX)
-        
-        # 偏向某个方向（例如：偏向X或Y的某个方向，让路径经过桌面/phantom）
-        direction = np.array([
-            np.random.choice([-1, 1]) * np.random.uniform(0.5, 1.0),  # X方向偏向
-            np.random.choice([-1, 1]) * np.random.uniform(0.3, 0.8),  # Y方向
-            np.random.uniform(-0.5, 0.5)  # Z方向随机
-        ])
-        direction = direction / (np.linalg.norm(direction) + 1e-8)
-        
-        desired_ee_base_pos = target_base_pos + direction * distance
-        
-        is_valid, reason = check_workspace_constraint(desired_ee_base_pos)
-        if not is_valid:
-            if attempt < 5 or attempt % 20 == 0:
-                print(f"   ⏳ Hard case采样尝试 {attempt+1}/{max_attempts}: {reason}")
-            continue
-        
-        # 使用随机采样+最近邻搜索
-        best_config = None
-        best_distance = float('inf')
-        base_config = sample_random_joint_config(num_joints)
-        
-        for ik_attempt in range(50):
-            if ik_attempt < 20:
-                joint_positions = sample_random_joint_config(num_joints, base_config, variation_scale=0.5)
-            else:
-                joint_positions = sample_random_joint_config(num_joints)
-            
-            robot.set_joint_velocities(np.zeros(num_joints))
-            robot.set_joint_positions(joint_positions)
-            for _ in range(10):
-                sim.step(render=False)
-            
-            try:
-                tcp_prim = XFormPrim("/World/Panda/TCP")
-                tcp_world_pos, _ = tcp_prim.get_world_pose()
-                tcp_base_pos = world_to_base_func(tcp_world_pos)
-                dist = np.linalg.norm(tcp_base_pos - desired_ee_base_pos)
-                
-                if dist < best_distance:
-                    best_distance = dist
-                    best_config = joint_positions.copy()
-                    if dist < 0.05:
-                        return joint_positions, tcp_base_pos
-            except:
-                continue
-        
-        if best_config is not None and best_distance < 0.10:
-            robot.set_joint_velocities(np.zeros(num_joints))
-            robot.set_joint_positions(best_config)
-            for _ in range(10):
-                sim.step(render=False)
-            try:
-                tcp_prim = XFormPrim("/World/Panda/TCP")
-                tcp_world_pos, _ = tcp_prim.get_world_pose()
-                tcp_base_pos = world_to_base_func(tcp_world_pos)
-                return best_config, tcp_base_pos
-            except:
-                continue
-    
-    return None, None
-
-def sample_diverse_initial_config(robot, sim, marker_world_pos, bucket_type="random"):
-    """
-    多样化的初始配置采样（三种桶混合）
-    
-    Args:
-        robot: 机器人对象
-        sim: 仿真上下文
-        marker_world_pos: marker的世界坐标
-        bucket_type: "bucket_a" (近处微调), "bucket_b" (中等偏离), "bucket_c" (hard cases), "random" (正常分布)
-    
-    Returns:
-        (joint_positions, ee_pos_base, config_type) 或 (None, None, None) 如果失败
-    """
-    # 获取 Panda base 的世界变换（复用 sample_valid_initial_config 的逻辑）
-    base_quat = None
-    base_pos = None
-    
-    try:
-        base_prim = XFormPrim("/World/Panda")
-        base_world_pos, base_world_orn = base_prim.get_world_pose()
-        base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
-        base_orn = [float(base_world_orn[0]), float(base_world_orn[1]), float(base_world_orn[2]), float(base_world_orn[3])]
-        base_quat = Gf.Quatd(float(base_orn[0]), Gf.Vec3d(float(base_orn[1]), float(base_orn[2]), float(base_orn[3])))
-    except Exception as e:
-        try:
-            base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
-        except:
-            base_pos = [0.0, 0.0, 0.0]
-        base_quat = None
-    
-    def world_to_base(p_world):
-        p_world = np.array([float(p_world[0]), float(p_world[1]), float(p_world[2])], dtype=float)
-        p_rel = Gf.Vec3d(p_world[0] - float(base_pos[0]),
-                         p_world[1] - float(base_pos[1]),
-                         p_world[2] - float(base_pos[2]))
-        if base_quat is None:
-            return np.array([float(p_rel[0]), float(p_rel[1]), float(p_rel[2])], dtype=float)
-        q_inv = base_quat.GetInverse()
-        p_base = q_inv.Transform(p_rel)
-        return np.array([float(p_base[0]), float(p_base[1]), float(p_base[2])], dtype=float)
-    
-    # 根据 bucket_type 决定采样策略
-    if bucket_type == "bucket_a":
-        # Bucket A: 近处微调
-        print(f"   🎯 [Bucket A] 尝试在目标附近采样初始配置（距离 {NEAR_TARGET_DISTANCE_MIN}-{NEAR_TARGET_DISTANCE_MAX}m）...")
-        joint_positions, ee_pos_base = sample_near_target_config(
-            robot, sim, marker_world_pos, world_to_base, max_attempts=100
-        )
-        if joint_positions is not None:
-            return joint_positions, ee_pos_base, "bucket_a"
-        else:
-            print(f"   ⚠️ Bucket A 采样失败，回退到随机采样")
-    
-    elif bucket_type == "bucket_b":
-        # Bucket B: 中等偏离纠偏
-        print(f"   🎯 [Bucket B] 尝试中等偏离采样初始配置（距离 {MEDIUM_OFFSET_DISTANCE_MIN}-{MEDIUM_OFFSET_DISTANCE_MAX}m）...")
-        joint_positions, ee_pos_base = sample_medium_offset_config(
-            robot, sim, marker_world_pos, world_to_base, max_attempts=100
-        )
-        if joint_positions is not None:
-            return joint_positions, ee_pos_base, "bucket_b"
-        else:
-            print(f"   ⚠️ Bucket B 采样失败，回退到随机采样")
-    
-    elif bucket_type == "bucket_c":
-        # Bucket C: Hard cases
-        print(f"   🎯 [Bucket C] 尝试Hard case采样初始配置（距离 {HARD_CASE_OFFSET_MIN}-{HARD_CASE_OFFSET_MAX}m）...")
-        joint_positions, ee_pos_base = sample_hard_case_config(
-            robot, sim, marker_world_pos, world_to_base, max_attempts=100
-        )
-        if joint_positions is not None:
-            return joint_positions, ee_pos_base, "bucket_c"
-        else:
-            print(f"   ⚠️ Bucket C 采样失败，回退到随机采样")
-    
-    # 随机采样（默认或回退）
-    print(f"   🎲 使用随机采样寻找工作空间内的初始配置...")
-    joint_positions, ee_pos_base = sample_valid_initial_config(robot, sim, max_attempts=100)
-    if joint_positions is not None:
-        return joint_positions, ee_pos_base, "random"
-    
-    return None, None, None
-
-def determine_bucket_type(episode_idx, num_episodes):
-    """
-    根据episode索引决定使用哪种桶
-    
-    分配策略（按专家建议）：
-    - 80集：中等偏离纠偏（Bucket B，40%）
-    - 80集：正常分布（random，40%）
-    - 40集：near-marker微调（Bucket A，20%）
-    
-    注意：Bucket C（Hard cases）暂时不单独分配，而是通过随机分布中的hard cases实现
-    
-    Args:
-        episode_idx: 当前episode索引
-        num_episodes: 总episode数
-    
-    Returns:
-        bucket_type: "bucket_a", "bucket_b", "bucket_c", "random"
-    """
-    # 计算每种桶的数量（按专家建议：80集/80集/40集）
-    num_bucket_b = int(num_episodes * BUCKET_B_RATIO)  # 80集（40%）
-    num_random = int(num_episodes * (1.0 - BUCKET_A_RATIO - BUCKET_B_RATIO))  # 80集（40%）
-    num_bucket_a = int(num_episodes * BUCKET_A_RATIO)  # 40集（20%）
-    
-    # 按顺序分配（确保比例准确）
-    if episode_idx < num_bucket_b:
-        return "bucket_b"  # 0-79: 中等偏离纠偏（最重要！）
-    elif episode_idx < num_bucket_b + num_random:
-        # 80-159: 正常分布（其中一部分随机选择为hard cases）
-        # 在正常分布中，随机选择20%作为hard cases
-        random_idx_in_normal = episode_idx - num_bucket_b
-        if random_idx_in_normal < int(num_random * BUCKET_C_RATIO):
-            return "bucket_c"  # 前20%作为hard cases
-        else:
-            return "random"  # 后80%正常分布
-    elif episode_idx < num_bucket_b + num_random + num_bucket_a:
-        return "bucket_a"  # 160-199: 近处微调
-    else:
-        # 剩余的使用随机
-        return "random"
-
 # ===================== 主函数 =====================
 def main():
     # --- 1. 环境加载 ---
@@ -753,16 +362,15 @@ def main():
     temp_picture_dir = os.path.join(DATASET_ROOT, "temp_picture_data")
     os.makedirs(temp_metadata_dir, exist_ok=True)
     os.makedirs(temp_picture_dir, exist_ok=True)
-    
+
     for episode_idx in range(NUM_EPISODES):
         # ----------------------------------------
         # (A) Episode 初始化与随机化
         # ----------------------------------------
-        # 先保存到临时目录，episode结束后根据成功/失败移动到对应目录
         ep_dir = os.path.join(temp_picture_dir, f"episode_{episode_idx:04d}")
         os.makedirs(ep_dir, exist_ok=True)
-        
-        # 1. 获取marker位置（用于多样化采样）
+
+        # 1. 获取marker位置
         try:
             marker_prim = XFormPrim(MARKER_PATH)
             marker_world_pos, _ = marker_prim.get_world_pose()
@@ -770,58 +378,49 @@ def main():
         except Exception as e:
             print(f"   ⚠️ 无法获取marker位置: {e}，使用默认位置")
             marker_world_pos = None
-        
-        # 2. 根据episode索引决定使用哪种桶
-        bucket_type = determine_bucket_type(episode_idx, NUM_EPISODES)
-        
-        print(f"   🎲 使用多样化采样寻找工作空间内的初始配置...")
+
+        print(f"   🎲 使用拒绝采样寻找工作空间内的初始配置...")
         print(f"      工作空间: 中心={WORKSPACE_CENTER}, 半径={WORKSPACE_RADIUS}m, Z范围=[{WORKSPACE_Z_MIN}, {WORKSPACE_Z_MAX}]m")
-        print(f"      当前桶类型: {bucket_type} (Episode {episode_idx}/{NUM_EPISODES})")
-        print(f"      分配策略: {int(NUM_EPISODES*BUCKET_B_RATIO)}集Bucket B, {int(NUM_EPISODES*(1-BUCKET_A_RATIO-BUCKET_B_RATIO-BUCKET_C_RATIO))}集随机, {int(NUM_EPISODES*BUCKET_A_RATIO)}集Bucket A, {int(NUM_EPISODES*BUCKET_C_RATIO)}集Bucket C")
-        
+
         if marker_world_pos is not None:
-            random_joint_positions, ee_pos_base, config_type = sample_diverse_initial_config(
-                robot, sim, marker_world_pos, bucket_type=bucket_type
-            )
-        else:
-            # 如果无法获取marker位置，回退到随机采样
             random_joint_positions, ee_pos_base = sample_valid_initial_config(robot, sim, max_attempts=100)
-            config_type = "random"
-        
+            config_type = "rejection_sampling"
+        else:
+            random_joint_positions = sample_random_joint_config(robot.num_dof)
+            robot.set_joint_positions(random_joint_positions)
+            config_type = "fallback"
+
         if random_joint_positions is None:
             print(f"   ⚠️ 无法找到有效配置，使用随机配置（可能不在工作空间内）")
             random_joint_positions = sample_random_joint_config(robot.num_dof)
             robot.set_joint_positions(random_joint_positions)
             config_type = "fallback"
         else:
-            # 配置已设置，只需确保位置正确
             robot.set_joint_positions(random_joint_positions)
-        
+
         print(f"   📍 初始关节配置类型: {config_type}")
         print(f"   📍 初始关节配置: {[f'{q:.3f}' for q in random_joint_positions]}")
-        
+
         # 2. 物理稳态预热
         robot.set_joint_velocities(np.zeros(robot.num_dof))
         for _ in range(30):
             sim.step(render=True)
-        
 
         current_marker_pos = default_marker_pos  # marker 真实位置维持不变
-        
+
         episode_metadata = []
-        prev_dq = None  # 上一时刻的关节速度，用于计算加速度
-        episode_success = False  # 初始假设失败，在最后一步检查成功条件
-        last_command_q = None  # 保存最后一步的command_q，用于终止帧保存
-        
-        # 成功条件：在最后一步检查末端执行器是否接近marker
-        SUCCESS_DISTANCE_X_MAX = 0.1   # 米，X方向最大距离
-        SUCCESS_DISTANCE_Y_MAX = 0.1   # 米，Y方向最大距离
-        SUCCESS_DISTANCE_Z_MAX = 0.3   # 米，Z方向最大距离
-        
-        # 初始化episode结束信息（默认超时）
+        prev_dq = None
+        episode_success = False
+        last_command_q = None
+
+        # 成功条件
+        SUCCESS_DISTANCE_X_MAX = 0.1
+        SUCCESS_DISTANCE_Y_MAX = 0.1
+        SUCCESS_DISTANCE_Z_MAX = 0.3
+
         end_reason = "timeout"
         end_step = STEPS_PER_EPISODE - 1
-        
+
         print(f"🎬 Episode {episode_idx}/{NUM_EPISODES} 开始...")
         print(f"   将运行固定 {STEPS_PER_EPISODE} 步，最后一步检查成功条件")
         print(f"   成功条件: diff_x < {SUCCESS_DISTANCE_X_MAX}m, diff_y < {SUCCESS_DISTANCE_Y_MAX}m, diff_z < {SUCCESS_DISTANCE_Z_MAX}m")
@@ -829,52 +428,55 @@ def main():
         # ----------------------------------------
         # (B) Step 循环
         # ----------------------------------------
+        capture_every_n = CAPTURE_EVERY_N_DEFAULT
         for step in range(STEPS_PER_EPISODE):
             if not simulation_app.is_running(): break
 
             # --- 1. 计算动作（每一步都需要，用于控制）---
-            # 目标 = marker 当前位置 + 固定 offset（完全不加随机扰动）
             target_pose_world = current_marker_pos + np.array(TARGET_OFFSET)
             rmp.set_end_effector_target(target_pose_world, default_marker_orn)
-            
+
             action = policy.get_next_articulation_action(DT)
 
-            # 取出当前这一步的"关节命令位置"作为 q_cmd(t)
             if action.joint_positions is not None:
                 command_q = np.array(action.joint_positions)
             else:
-                # 退化方案：如果没有给出绝对关节位置，就把当前 q 当作命令
                 q_current = robot.get_joint_positions()
                 command_q = np.array(q_current)
-            
-            # 保存command_q供终止帧使用
+
             last_command_q = command_q.copy()
 
-            # --- 2. 只在每5步时：计算delta_q、截图、记录数据 ---
-            if step % CAPTURE_EVERY_N == 0:
-                # 获取当前状态（用于记录）
+            # --- 动态调整采集频率 ---
+            try:
+                ee_prim = XFormPrim("/World/Panda/TCP")
+                ee_actual_pos, _ = ee_prim.get_world_pose()
+                marker_prim = XFormPrim(MARKER_PATH)
+                marker_pos, _ = marker_prim.get_world_pose()
+                ee_actual_pos = np.array([float(ee_actual_pos[0]), float(ee_actual_pos[1]), float(ee_actual_pos[2])])
+                marker_pos = np.array([float(marker_pos[0]), float(marker_pos[1]), float(marker_pos[2])])
+                tcp_marker_dist = np.linalg.norm(ee_actual_pos - marker_pos)
+                if tcp_marker_dist < threshold_distance_close:
+                    capture_every_n = CAPTURE_EVERY_N_CLOSE
+                else:
+                    capture_every_n = CAPTURE_EVERY_N_DEFAULT
+            except Exception as e:
+                # 如果获取失败，保持默认
+                capture_every_n = CAPTURE_EVERY_N_DEFAULT
+
+            # --- 2. 只在每capture_every_n步时采集 ---
+            if step % capture_every_n == 0:
                 q_current = robot.get_joint_positions()
                 dq_current = robot.get_joint_velocities()
-                
-                # 计算 delta_q = 当前命令 - 当前状态
-                # 这是经典的 BC 监督信号：image(t) -> delta_q(t)
-                # delta_q 表示"在当前图像下，expert 希望关节朝命令方向移动多少"
                 delta_q = command_q - q_current
-                
-                # 截图：捕获当前状态的图片
                 img_filename = f"frame_{step:04d}.png"
                 img_path = os.path.join(ep_dir, img_filename)
                 cam.capture(img_path)
-                
-                # 获取实际末端执行器位置（TCP 的物理位置）
                 try:
                     ee_prim = XFormPrim("/World/Panda/TCP")
                     ee_actual_pos, ee_actual_orn = ee_prim.get_world_pose()
                 except:
                     ee_actual_pos = None
                     ee_actual_orn = None
-                
-                # 记录数据（使用 vec3_to_list 确保 JSON 序列化安全）
                 step_data = {
                     "step": step,
                     "image_path": img_filename,
@@ -888,7 +490,6 @@ def main():
                     "action": {
                         "command_positions": command_q,
                         "command_velocities": action.joint_velocities,
-                        # delta_q: 当前命令 - 当前状态，表示"在当前图像下应该移动多少"
                         "delta_q": delta_q
                     }
                 }
@@ -897,51 +498,39 @@ def main():
             # --- 3. 应用动作并推进仿真（每一步都需要）---
             robot.apply_action(action)
             sim.step(render=True)
-            
+
             # --- 4. 检查碰撞（检测到碰撞立即终止episode）---
-            # 获取step后的关节速度（碰撞会导致速度突然变化）
             dq_after_step = robot.get_joint_velocities()
-            
             has_collision = False
             collision_reason = ""
-            
-            # 方法1: 检查速度是否超过阈值（碰撞时速度会突然增大）
             max_velocity = np.max(np.abs(dq_after_step))
             if max_velocity > COLLISION_VELOCITY_THRESHOLD:
                 has_collision = True
                 collision_reason = f"速度异常: {max_velocity:.2f} rad/s > {COLLISION_VELOCITY_THRESHOLD} rad/s"
-            
-            # 方法2: 检查加速度是否超过阈值（碰撞时加速度会突然增大）
             if prev_dq is not None and not has_collision:
                 acceleration = (dq_after_step - prev_dq) / DT
                 max_acceleration = np.max(np.abs(acceleration))
                 if max_acceleration > COLLISION_ACCELERATION_THRESHOLD:
                     has_collision = True
                     collision_reason = f"加速度异常: {max_acceleration:.2f} rad/s² > {COLLISION_ACCELERATION_THRESHOLD} rad/s²"
-            
             if has_collision:
                 episode_success = False
                 end_reason = "collision"
                 end_step = step
                 print(f"   ⚠️ Episode {episode_idx} 在第 {step} 步发生碰撞 ({collision_reason})，立即结束该episode")
-                
-                # 如果终止步不是记录帧，强制保存最后一帧
-                if step % CAPTURE_EVERY_N != 0:
+                if step % capture_every_n != 0:
                     q_current = robot.get_joint_positions()
                     dq_current = robot.get_joint_velocities()
                     delta_q = command_q - q_current
-                    
                     img_filename = f"frame_{step:04d}.png"
                     img_path = os.path.join(ep_dir, img_filename)
                     cam.capture(img_path)
-                    
                     try:
                         ee_prim = XFormPrim("/World/Panda/TCP")
                         ee_actual_pos, ee_actual_orn = ee_prim.get_world_pose()
                     except:
                         ee_actual_pos = None
                         ee_actual_orn = None
-                    
                     step_data = {
                         "step": step,
                         "image_path": img_filename,
@@ -960,10 +549,7 @@ def main():
                     }
                     episode_metadata.append(step_data)
                     print(f"   💾 已强制保存终止帧 {step}")
-                
-                break  # 立即结束当前episode
-            
-            # 保存当前速度供下一step使用
+                break
             prev_dq = dq_after_step.copy()
 
         # ----------------------------------------
@@ -996,27 +582,23 @@ def main():
                           f"(X={diff_x:.3f}m, Y={diff_y:.3f}m, Z={diff_z:.3f}m)")
                     
                     # 如果成功终止步不是记录帧，强制保存最后一帧（关键纠偏瞬间）
-                    if end_step % CAPTURE_EVERY_N != 0:
+                    if end_step % capture_every_n != 0:
                         q_current = robot.get_joint_positions()
                         dq_current = robot.get_joint_velocities()
-                        # 使用保存的最后一步的command_q
                         if last_command_q is not None:
                             command_q = last_command_q
                         else:
-                            command_q = q_current  # 回退方案
+                            command_q = q_current
                         delta_q = command_q - q_current
-                        
                         img_filename = f"frame_{end_step:04d}.png"
                         img_path = os.path.join(ep_dir, img_filename)
                         cam.capture(img_path)
-                        
                         try:
                             ee_prim = XFormPrim("/World/Panda/TCP")
                             ee_actual_pos, ee_actual_orn = ee_prim.get_world_pose()
                         except:
                             ee_actual_pos = None
                             ee_actual_orn = None
-                        
                         step_data = {
                             "step": end_step,
                             "image_path": img_filename,
@@ -1029,7 +611,7 @@ def main():
                             },
                             "action": {
                                 "command_positions": command_q,
-                                "command_velocities": np.zeros(7),  # 近似值
+                                "command_velocities": np.zeros(7),
                                 "delta_q": delta_q
                             }
                         }
