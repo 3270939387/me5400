@@ -33,7 +33,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from dataset import MarkerDataset
+from dataset import MixedDataset
 
 
 # ----------------------------- Utilities -----------------------------
@@ -89,8 +89,11 @@ def plot_hist(data: np.ndarray, title: str, xlabel: str, out_path: str, bins: in
 # ----------------------------- Data -----------------------------
 
 def make_loaders(dataset_root, batch_size=64, num_workers=4, image_size_hw=(240, 320), only_success=False):
-    train_set = MarkerDataset(dataset_root, split="train", image_size_hw=image_size_hw, only_success=only_success)
-    val_set = MarkerDataset(dataset_root, split="val", image_size_hw=image_size_hw, only_success=only_success)
+    # dataset_root 现在不再用作单一目录，而是 expert/DAgger 路径父目录
+    expert_dir = os.path.join(dataset_root, "expert_data")
+    dagger_dir = os.path.join(dataset_root, "dagger_data")
+    train_set = MixedDataset(expert_dir, dagger_dir, split="train", image_size_hw=image_size_hw, only_success=only_success)
+    val_set = MixedDataset(expert_dir, dagger_dir, split="val", image_size_hw=image_size_hw, only_success=only_success)
 
     train_loader = DataLoader(
         train_set,
@@ -238,7 +241,6 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip: float = 0.0) ->
         if grad_clip and grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-
         bs = images.size(0)
         total_loss += loss.item() * bs
         n += bs
@@ -270,7 +272,7 @@ class EarlyStopper:
 
 def main():
     parser = argparse.ArgumentParser(description="Managed BC Training (ResNet18 + MLP)")
-    parser.add_argument("--dataset_root", type=str, default="/home/alphatok/ME5400/expert_data")
+    parser.add_argument("--dataset_root", type=str, default="/home/wopubuntu/me5400/rp_collect/DATA")
     parser.add_argument("--out_dir", type=str, default="./checkpoints_bc_managed")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
