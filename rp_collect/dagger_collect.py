@@ -17,6 +17,7 @@ from isaacsim import SimulationApp
 # DAgger 建议 headless=False 便于观察，但可按需修改
 simulation_app = SimulationApp({"headless": False})
 
+import sys
 import os
 import json
 import time
@@ -29,11 +30,10 @@ from pxr import UsdPhysics, Gf, Usd
 import torch
 from torchvision import transforms
 from PIL import Image
-import sys
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ROOT_DIR = "/home/wopubuntu/me5400"
 if ROOT_DIR not in sys.path:
-    sys.path.append(ROOT_DIR)
+    sys.path.insert(0, ROOT_DIR)
 
 from omni.isaac.core import SimulationContext
 from isaacsim.core.prims import SingleArticulation as Articulation
@@ -47,7 +47,7 @@ from training.train_bc import ResNetMLPPolicy
 
 
 # ===================== ⚙️ 默认配置 =====================
-ENV_USD_PATH = "/home/wopubuntu/me5400/env.setup/env.usda"
+ENV_USD_PATH = "/home/wopubuntu/me5400/env.setup/env_single_arm.usda"
 MARKER_PATH = "/World/Phantom/marker"
 ROBOT_PATH = "/World/Panda"
 TABLE_PATH = "/World/Table"
@@ -83,13 +83,26 @@ class ViewportCamera:
         self.viewport_api.set_texture_resolution(resolution)
 
     def capture(self, filename):
-        capture_viewport_to_file(self.viewport_api, filename)
+        try:
+            capture_viewport_to_file(self.viewport_api, filename)
+            return True
+        except Exception as e:
+            print(f"❌ 截图异常: {e}")
+            return False
 
 
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
+        elif isinstance(obj, (np.bool_, np.bool8)):  # 处理numpy布尔类型
+            return bool(obj)
+        elif isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8,
+                              np.int16, np.int32, np.int64, np.uint8, np.uint16,
+                              np.uint32, np.uint64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
+            return float(obj)
         return json.JSONEncoder.default(self, obj)
 
 
@@ -114,56 +127,117 @@ def sample_random_joint_config(num_joints):
     return np.array(cfg, dtype=np.float32)
 
 
-def check_workspace(ee_pos_base):
+def check_workspace_constraint(ee_pos_base):
+    """
+    检查末端执行器位置是否在工作空间内
+    ee_pos_base: 末端执行器在 Panda base 坐标系下的位置 (x, y, z)
+    返回: (is_valid, reason)
+    """
+    # 1. 检查球约束：||p_ee - center|| <= radius
     offset = ee_pos_base - WORKSPACE_CENTER
-    dist = np.linalg.norm(offset)
-    if dist > WORKSPACE_RADIUS:
-        return False, f"超出球半径: {dist:.3f}m"
+    distance = np.linalg.norm(offset)
+    if distance > WORKSPACE_RADIUS:
+        return False, f"超出球半径: {distance:.3f}m > {WORKSPACE_RADIUS}m"
+    
+    # 2. 检查Z范围约束：z_min <= z <= z_max
     z = ee_pos_base[2]
     if z < WORKSPACE_Z_MIN:
-        return False, f"Z过低: {z:.3f}m"
+        return False, f"Z过低: {z:.3f}m < {WORKSPACE_Z_MIN}m"
     if z > WORKSPACE_Z_MAX:
-        return False, f"Z过高: {z:.3f}m"
+        return False, f"Z过高: {z:.3f}m > {WORKSPACE_Z_MAX}m"
+    
     return True, "OK"
 
 
-def world_to_base(world_pos, base_pos, base_quat):
-    p_world = np.array(world_pos, dtype=float)
-    p_rel = Gf.Vec3d(p_world[0] - float(base_pos[0]),
-                     p_world[1] - float(base_pos[1]),
-                     p_world[2] - float(base_pos[2]))
-    if base_quat is None:
-        return np.array([float(p_rel[0]), float(p_rel[1]), float(p_rel[2])], dtype=float)
-    q_inv = base_quat.GetInverse()
-    p_base = q_inv.Transform(p_rel)
-    return np.array([float(p_base[0]), float(p_base[1]), float(p_base[2])], dtype=float)
-
-
-def find_valid_start(robot, sim, max_attempts=60):
-    base_prim = XFormPrim("/World/Panda")
-    base_world_pos, base_world_orn = base_prim.get_world_pose()
-    base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
+def sample_valid_initial_config(robot, sim, max_attempts=100):
+    """
+    使用拒绝采样找到工作空间内的有效初始配置
+    返回: (joint_positions, ee_pos_base) 或 (None, None) 如果失败
+    """
+    # 获取 Panda base 的世界变换
+    base_quat = None
+    base_pos = None
+    
     try:
-        base_quat = Gf.Quatd(float(base_world_orn[0]), Gf.Vec3d(float(base_world_orn[1]), float(base_world_orn[2]), float(base_world_orn[3])))
-    except Exception:
+        base_prim = XFormPrim("/World/Panda")
+        base_world_pos, base_world_orn = base_prim.get_world_pose()
+        
+        # 确保转换为 Python float（Gf 需要 double 类型）
+        base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
+        base_orn = [float(base_world_orn[0]), float(base_world_orn[1]), float(base_world_orn[2]), float(base_world_orn[3])]
+        
+        # 使用 Gf 库处理四元数和旋转
+        # base_orn 是 (w, x, y, z) 格式
+        # base_quat: Gf.Quatd(w, Vec3d(x,y,z))
+        base_quat = Gf.Quatd(float(base_orn[0]), Gf.Vec3d(float(base_orn[1]), float(base_orn[2]), float(base_orn[3])))
+        
+    except Exception as e:
+        print(f"⚠️ 无法获取base变换: {e}，使用简化方法（仅平移）")
+        # 简化方法：只考虑平移（转换为 float 避免类型错误）
+        try:
+            base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
+        except:
+            # 如果 base_world_pos 也不存在，使用默认值
+            base_pos = [0.0, 0.0, 0.0]
         base_quat = None
-
+    
+    # 构建从world到base的变换
+    def world_to_base(p_world):
+        # p_rel = p_world - base_pos
+        p_world = np.array([float(p_world[0]), float(p_world[1]), float(p_world[2])], dtype=float)
+        p_rel = Gf.Vec3d(p_world[0] - float(base_pos[0]),
+                         p_world[1] - float(base_pos[1]),
+                         p_world[2] - float(base_pos[2]))
+        
+        # 如果拿不到旋转，就退化为仅平移
+        if base_quat is None:
+            return np.array([float(p_rel[0]), float(p_rel[1]), float(p_rel[2])], dtype=float)
+        
+        # world -> base: 乘以 base 的逆旋转
+        q_inv = base_quat.GetInverse()
+        
+        # ✅ 关键：用四元数旋转向量（Gf 支持 Transform）
+        p_base = q_inv.Transform(p_rel)
+        
+        return np.array([float(p_base[0]), float(p_base[1]), float(p_base[2])], dtype=float)
+    
+    num_joints = robot.num_dof
+    
     for attempt in range(max_attempts):
-        q = sample_random_joint_config(robot.num_dof)
-        robot.set_joint_velocities(np.zeros(robot.num_dof))
-        robot.set_joint_positions(q)
+        # 1. 随机采样关节配置
+        joint_positions = sample_random_joint_config(num_joints)
+        
+        # 2. 设置关节位置（先重置速度，避免突然变化）
+        robot.set_joint_velocities(np.zeros(num_joints))
+        robot.set_joint_positions(joint_positions)
+        
+        # 3. 推进更多帧让物理稳定（减少 PhysX 警告）
         for _ in range(10):
             sim.step(render=False)
+        
+        # 4. 获取TCP的世界坐标（使用真实路径 /World/Panda/TCP）
         try:
-            tcp = XFormPrim("/World/Panda/TCP")
-            tcp_world_pos, _ = tcp.get_world_pose()
-        except Exception:
+            tcp_prim = XFormPrim("/World/Panda/TCP")
+            tcp_world_pos, _ = tcp_prim.get_world_pose()
+        except Exception as e:
+            # 如果TCP获取失败，跳过这次尝试
             continue
-        tcp_base = world_to_base(tcp_world_pos, base_pos, base_quat)
-        ok, _ = check_workspace(tcp_base)
-        if ok:
-            return q
-    return None
+        
+        # 5. 转换到base坐标系
+        tcp_base_pos = world_to_base(tcp_world_pos)
+        
+        # 6. 检查工作空间约束
+        is_valid, reason = check_workspace_constraint(tcp_base_pos)
+        
+        if is_valid:
+            print(f"   ✅ 找到有效配置 (尝试 {attempt+1} 次): TCP_base=({tcp_base_pos[0]:.3f}, {tcp_base_pos[1]:.3f}, {tcp_base_pos[2]:.3f})")
+            return joint_positions, tcp_base_pos
+        else:
+            if attempt < 5 or attempt % 20 == 0:  # 只打印前几次和每20次
+                print(f"   ⏳ 尝试 {attempt+1}/{max_attempts}: {reason}")
+    
+    print(f"   ❌ 在 {max_attempts} 次尝试后未找到有效配置")
+    return None, None
 
 
 class BCPolicy:
@@ -186,10 +260,23 @@ class BCPolicy:
 
     @torch.no_grad()
     def predict(self, image_path):
-        img = Image.open(image_path).convert("RGB")
-        tensor = self.transform(img).unsqueeze(0).to(self.device)
-        delta_q = self.model(tensor).squeeze(0).cpu().numpy()
-        return delta_q.astype(np.float32)
+        """
+        从图像路径加载并预测动作
+        注意：图像文件应该在调用此方法之前已经完整写入
+        """
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"图像文件不存在: {image_path}")
+        
+        try:
+            img = Image.open(image_path).convert("RGB")
+            # 验证图像完整性
+            img.verify()  # 验证但不加载数据
+            img = Image.open(image_path).convert("RGB")  # 重新打开以加载数据
+            tensor = self.transform(img).unsqueeze(0).to(self.device)
+            delta_q = self.model(tensor).squeeze(0).cpu().numpy()
+            return delta_q.astype(np.float32)
+        except Exception as e:
+            raise RuntimeError(f"加载或处理图像失败 {image_path}: {e}") from e
 
 
 # ===================== 主流程 =====================
@@ -198,13 +285,13 @@ def parse_args():
     parser.add_argument("--dataset_root", type=str, default=DEFAULT_DATASET_ROOT,
                         help="输出数据集根目录")
     parser.add_argument("--bc_checkpoint", type=str,
-                        default="/home/wopubuntu/me5400/training/checkpoints_bc_managed/best.pt",
+                        default="/home/wopubuntu/me5400/training/checkpoints_bc/best.pt",
                         help="BC 模型 checkpoint 路径（含 state_dict 或包含 model 字段）")
     parser.add_argument("--episodes", type=int, default=50, help="采集多少个 episode")
     parser.add_argument("--steps", type=int, default=200, help="每个 episode 的步数")
     parser.add_argument("--mix_beta", type=float, default=0.6,
                         help="混合系数：command = (1-beta)*expert + beta*policy")
-    parser.add_argument("--behavior", type=str, default="mixture", choices=["mixture", "policy", "expert"],
+    parser.add_argument("--behavior", type=str, default="policy", choices=["mixture", "policy", "expert"],
                         help="执行动作来源：mixture/policy/expert")
     parser.add_argument("--image_height", type=int, default=240)
     parser.add_argument("--image_width", type=int, default=320)
@@ -280,12 +367,14 @@ def main():
         os.makedirs(ep_dir, exist_ok=True)
         print(f"\n🎬 Episode {ep_idx}/{args.episodes}")
 
-        q0 = find_valid_start(robot, sim)
-        if q0 is None:
+        print(f"   🎲 使用拒绝采样寻找工作空间内的初始配置...")
+        print(f"      工作空间: 中心={WORKSPACE_CENTER}, 半径={WORKSPACE_RADIUS}m, Z范围=[{WORKSPACE_Z_MIN}, {WORKSPACE_Z_MAX}]m")
+        random_joint_positions, ee_pos_base = sample_valid_initial_config(robot, sim, max_attempts=100)
+        if random_joint_positions is None:
             print("   ⚠️ 无法找到工作空间内初始配置，跳过该 episode")
             shutil.rmtree(ep_dir, ignore_errors=True)
             continue
-        robot.set_joint_positions(q0)
+        robot.set_joint_positions(random_joint_positions)
         robot.set_joint_velocities(np.zeros(robot.num_dof))
         for _ in range(30):
             sim.step(render=True)
@@ -301,7 +390,73 @@ def main():
             # 1) 采集观测（保存到正式路径，便于直接训练）
             img_filename = f"frame_{step:04d}.png"
             img_path = os.path.join(ep_dir, img_filename)
-            cam.capture(img_path)
+            
+            # 图像捕获（参考 evaluate_bc.py 的实现，但使用更宽松的重试策略）
+            max_capture_retries = 3  # 增加重试次数
+            file_ready = False
+            
+            for capture_retry in range(max_capture_retries):
+                # 强制渲染更新（确保 viewport 已渲染）
+                for _ in range(3):  # 多次更新确保渲染完成
+                    simulation_app.update()
+                
+                # 捕获图像
+                if not cam.capture(img_path):
+                    if capture_retry < max_capture_retries - 1:
+                        # 捕获失败，等待后重试
+                        for _ in range(3):
+                            simulation_app.update()
+                        time.sleep(0.1)  # 增加等待时间
+                        continue
+                    else:
+                        print(f"   ⚠️ 第 {step} 步截图失败（已重试 {max_capture_retries} 次）")
+                        break
+                
+                # 强制刷新（确保文件写入开始）
+                for _ in range(3):
+                    simulation_app.update()
+                
+                # 等待文件写入完成（简化逻辑：只要文件大小 > 最小阈值即可）
+                min_bytes = 10_000  # 最小文件大小阈值（1280x720 PNG 一般远大于这个）
+                max_wait_attempts = 30  # 增加等待尝试次数
+                wait_attempt = 0
+                
+                while wait_attempt < max_wait_attempts:
+                    if os.path.exists(img_path):
+                        try:
+                            file_size = os.path.getsize(img_path)
+                            if file_size >= min_bytes:
+                                file_ready = True
+                                break
+                        except OSError:
+                            # 文件可能正在写入，继续等待
+                            pass
+                    # 每次检查时更新
+                    simulation_app.update()
+                    time.sleep(0.05)
+                    wait_attempt += 1
+                
+                if not file_ready:
+                    if capture_retry < max_capture_retries - 1:
+                        # 文件未就绪，等待后重试
+                        for _ in range(3):
+                            simulation_app.update()
+                        time.sleep(0.1)
+                        continue
+                    else:
+                        print(f"   ⚠️ 第 {step} 步图像文件未就绪（已重试 {max_capture_retries} 次，等待 {max_wait_attempts} 次）")
+                        break
+                else:
+                    break  # 文件就绪，退出重试循环
+            
+            if not file_ready:
+                print(f"   ⚠️ 第 {step} 步图像捕获失败，跳过该步")
+                # 继续执行下一步，但不记录数据
+                target_pose_world = np.array(default_marker_pos) + np.array([0.52, -0.07, -0.65])
+                rmp.set_end_effector_target(target_pose_world, default_marker_orn)
+                robot.apply_action(expert_policy.get_next_articulation_action(DT))
+                sim.step(render=True)
+                continue
 
             # 2) RMPFlow 专家动作
             target_pose_world = np.array(default_marker_pos) + np.array([0.52, -0.07, -0.65])
@@ -363,7 +518,7 @@ def main():
             ee_final_pos = np.array([float(ee_final_pos[0]), float(ee_final_pos[1]), float(ee_final_pos[2])])
             marker_final_pos = np.array(default_marker_pos)
             diff = np.abs(ee_final_pos - marker_final_pos)
-            success = (diff[0] < SUCCESS_DISTANCE[0]) and (diff[1] < SUCCESS_DISTANCE[1]) and (diff[2] < SUCCESS_DISTANCE[2])
+            success = bool((diff[0] < SUCCESS_DISTANCE[0]) and (diff[1] < SUCCESS_DISTANCE[1]) and (diff[2] < SUCCESS_DISTANCE[2]))
             if success:
                 end_reason = "success"
             else:
@@ -378,7 +533,7 @@ def main():
             "end_reason": end_reason,
             "end_step": len(episode_metadata) - 1,
             "num_saved_frames": len(episode_metadata),
-            "bucket_type": args.behavior,
+            "behavior_type": args.behavior,
             "steps": episode_metadata,
         }
         meta_path = os.path.join(meta_dir, f"episode_{ep_idx:04d}.json")
