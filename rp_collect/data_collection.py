@@ -189,28 +189,32 @@ def compute_marker_geometry(marker_world_pos, camera_world_pos, camera_quat, cam
         camera_world_pos = np.array([float(camera_world_pos[0]), float(camera_world_pos[1]), float(camera_world_pos[2])], dtype=np.float32)
         
         # 构建相机的旋转矩阵（从world到camera）
-        # 相机四元数格式：(w, x, y, z)
+        # 相机四元数格式：(w, x, y, z) - 表示相机相对于世界坐标系的方向
         w, qx, qy, qz = float(camera_quat[0]), float(camera_quat[1]), float(camera_quat[2]), float(camera_quat[3])
         
-        # 四元数转旋转矩阵
-        # q = w + x*i + y*j + z*k
-        # R = [[1-2(y²+z²), 2(xy-zw), 2(xz+yw)],
-        #      [2(xy+zw), 1-2(x²+z²), 2(yz-xw)],
-        #      [2(xz-yw), 2(yz+xw), 1-2(x²+y²)]]
-        R_world_to_cam = np.array([
+        # 四元数转旋转矩阵 (标准格式 q = w + xi + yj + zk)
+        # R_cam_to_world 表示从相机坐标系到世界坐标系的旋转
+        # 我们需要 R_world_to_cam = R_cam_to_world.T
+        R_cam_to_world = np.array([
             [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qz*w), 2*(qx*qz + qy*w)],
             [2*(qx*qy + qz*w), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*w)],
             [2*(qx*qz - qy*w), 2*(qy*qz + qx*w), 1 - 2*(qx**2 + qy**2)]
         ], dtype=np.float32)
         
+        # 反向旋转：从世界坐标系到相机坐标系
+        R_world_to_cam = R_cam_to_world.T
+        
         # marker在相机坐标系下的坐标
-        # p_cam = R * (p_world - t)
+        # p_cam = R_world_to_cam * (p_world - t_camera)
         p_relative = marker_world_pos - camera_world_pos
         p_cam = R_world_to_cam @ p_relative
         
         Xc, Yc, Zc = p_cam[0], p_cam[1], p_cam[2]
         
         # 如果marker在相机后面，标记为不可见
+        # 在OpenGL风格的相机坐标系中，+Z指向相机后方
+        # 标准针孔相机坐标系中，+Z指向物体方向
+        # 如果Zc <= 0（物体在相机背后），则不可见
         if Zc <= 0.01:  # 0.01m的最小深度阈值
             return {
                 "visible": False,
