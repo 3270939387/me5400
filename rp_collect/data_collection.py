@@ -445,20 +445,36 @@ def main():
     cam = ViewportCamera(CAM_PATH)
     
     # ========== 设置相机内参（针孔相机模型）==========
-    # 这里需要匹配实际的相机参数
-    # D405是RealSense摄像头，查询其内参或从USD配置中读取
-    # 为简化起见，这里使用标准值（在实际应用中应从相机配置读取）
-    # 
-    # 标准值基于1280×720分辨率下的D405内参：
-    # 实际值应根据仿真中的相机配置调整
+    # D405 RealSense相机的物理参数（从USD配置中提取）
+    # 根据物理参数计算焦距（像素单位）
     img_resolution = (1280, 720)  # 图像分辨率 (width, height)
+    img_width, img_height = img_resolution
+    
+    # 相机物理参数（来自USD配置）
+    focal_length_mm = 1.9299999475479126  # 焦距（毫米）
+    horiz_aperture_mm = 3.8959999084472656  # 水平光圈（毫米）
+    vert_aperture_mm = 2.453000068664551  # 垂直光圈（毫米）
+    
+    # 计算焦距（像素单位）
+    # fx = focal_length * (img_width / horiz_aperture)
+    # fy = focal_length * (img_height / vert_aperture)
+    fx = focal_length_mm * (img_width / horiz_aperture_mm)
+    fy = focal_length_mm * (img_height / vert_aperture_mm)
+    
+    # 主点通常位于图像中心
+    cx = img_width / 2.0
+    cy = img_height / 2.0
+    
     camera_intrinsics = {
-        'fx': 640.0,   # 焦距X（像素单位）
-        'fy': 640.0,   # 焦距Y（像素单位）
-        'cx': 640.0,   # 主点X（像素坐标）
-        'cy': 360.0    # 主点Y（像素坐标）
+        'fx': fx,   # 焦距X（像素单位）
+        'fy': fy,   # 焦距Y（像素单位）
+        'cx': cx,   # 主点X（像素坐标）
+        'cy': cy    # 主点Y（像素坐标）
     }
-    print(f"✅ 相机内参设置: {camera_intrinsics}, 分辨率: {img_resolution}")
+    print(f"✅ 相机内参已计算（D405实际物理参数）:")
+    print(f"   分辨率: {img_resolution}")
+    print(f"   焦距: {focal_length_mm} mm, 光圈: {horiz_aperture_mm}×{vert_aperture_mm} mm")
+    print(f"   计算内参: fx={fx:.4f}, fy={fy:.4f}, cx={cx:.4f}, cy={cy:.4f}")
     
     # 保存基础位置用于随机化（⚠️ 只读，不再移动 marker 本身）
     # marker 永远固定在 Phantom 上，我们只对"RMPFlow 的目标点"加噪声
