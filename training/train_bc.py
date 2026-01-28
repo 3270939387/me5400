@@ -33,7 +33,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from dataset import MixedDataset
+from dataset import MarkerDataset
 
 
 # ----------------------------- Utilities -----------------------------
@@ -89,11 +89,8 @@ def plot_hist(data: np.ndarray, title: str, xlabel: str, out_path: str, bins: in
 # ----------------------------- Data -----------------------------
 
 def make_loaders(dataset_root, batch_size=64, num_workers=4, image_size_hw=(240, 320), only_success=False):
-    # dataset_root 现在不再用作单一目录，而是 expert/DAgger 路径父目录
-    expert_dir = os.path.join(dataset_root, "expert_data")
-    dagger_dir = os.path.join(dataset_root, "dagger_data")
-    train_set = MixedDataset(expert_dir, dagger_dir, split="train", image_size_hw=image_size_hw, only_success=only_success)
-    val_set = MixedDataset(expert_dir, dagger_dir, split="val", image_size_hw=image_size_hw, only_success=only_success)
+    train_set = MarkerDataset(dataset_root, split="train", image_size_hw=image_size_hw, only_success=only_success)
+    val_set = MarkerDataset(dataset_root, split="val", image_size_hw=image_size_hw, only_success=only_success)
 
     train_loader = DataLoader(
         train_set,
@@ -117,21 +114,62 @@ def make_loaders(dataset_root, batch_size=64, num_workers=4, image_size_hw=(240,
 # ----------------------------- Model -----------------------------
 
 class ResNetMLPPolicy(nn.Module):
-    def __init__(self, out_dim=7):
+    """
+    ResNet18 + MLP 策略网络，支持 marker 几何信息 (u, v, s)
+    
+    输入：
+      - image: [B, 3, H, W] - RGB图像
+      - marker_geom: [B, 3] - marker的(u, v, s) 信息
+    
+    前向过程：
+      1. ResNet18 backbone 提取图像特征 → [B, 512]
+      2. 将marker_geom拼接到特征向量 → [B, 515]
+      3. MLP 处理拼接后的特征 → [B, 7]（delta_q）
+    
+    优点：
+      - 显式加入marker的几何信息，减少多解问题
+      - 模型能够学习图像特征和几何约束的联合表示
+      - 简单高效，无需改变基础的BC框架
+    """
+    def __init__(self, out_dim=7, marker_geom_dim=3):
         super().__init__()
+        # ResNet18 backbone (去掉最后的全连接层)
         backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])  # [B,512,1,1]
+        
+        # MLP head: 拼接图像特征和marker几何信息
+        # 输入维度 = image_features (512) + marker_geom (3) = 515
+        mlp_input_dim = 512 + marker_geom_dim
+        
         self.head = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(mlp_input_dim, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, out_dim),
         )
 
-    def forward(self, x):
-        feat = self.backbone(x).flatten(1)  # [B,512]
-        return self.head(feat)              # [B,7]
+    def forward(self, x, marker_geom=None):
+        """
+        前向传播
+        
+        Args:
+            x: [B, 3, H, W] - RGB图像
+            marker_geom: [B, 3] - marker的(u, v, s)信息，或None
+        
+        Returns:
+            [B, 7] - 预测的delta_q
+        """
+        # 提取图像特征
+        feat = self.backbone(x).flatten(1)  # [B, 512]
+        
+        # 如果提供了marker几何信息，拼接到特征向量
+        if marker_geom is not None:
+            # marker_geom: [B, 3]
+            feat = torch.cat([feat, marker_geom], dim=1)  # [B, 515]
+        
+        # 通过MLP head输出动作
+        return self.head(feat)  # [B, 7]
 
 def freeze_backbone(model: ResNetMLPPolicy, freeze: bool = True):
     for p in model.backbone.parameters():
@@ -177,7 +215,14 @@ def evaluate(model, loader, device) -> EvalStats:
     for batch in pbar:
         images = batch["image"].to(device, non_blocking=True)
         target = batch["delta_q"].to(device, non_blocking=True)  # [B,7]
-        pred = model(images)
+        
+        # 获取marker几何信息
+        marker_geom = batch.get("marker_uvs", None)
+        if marker_geom is not None:
+            marker_geom = marker_geom.to(device, non_blocking=True)  # [B,3]
+        
+        # 前向传播，传入marker几何信息
+        pred = model(images, marker_geom)
 
         mse_sum = loss_fn(pred, target).item()
         total_mse_sum += mse_sum
@@ -232,8 +277,14 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip: float = 0.0) ->
     for batch in pbar:
         images = batch["image"].to(device, non_blocking=True)
         target = batch["delta_q"].to(device, non_blocking=True)
+        
+        # 获取marker几何信息
+        marker_geom = batch.get("marker_uvs", None)
+        if marker_geom is not None:
+            marker_geom = marker_geom.to(device, non_blocking=True)  # [B,3]
 
-        pred = model(images)
+        # 前向传播，传入marker几何信息
+        pred = model(images, marker_geom)
         loss = loss_fn(pred, target)
 
         optimizer.zero_grad(set_to_none=True)
@@ -241,6 +292,7 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip: float = 0.0) ->
         if grad_clip and grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+
         bs = images.size(0)
         total_loss += loss.item() * bs
         n += bs
@@ -272,7 +324,7 @@ class EarlyStopper:
 
 def main():
     parser = argparse.ArgumentParser(description="Managed BC Training (ResNet18 + MLP)")
-    parser.add_argument("--dataset_root", type=str, default="/home/wopubuntu/me5400/rp_collect/DATA")
+    parser.add_argument("--dataset_root", type=str, default="/home/alphatok/ME5400/expert_data")
     parser.add_argument("--out_dir", type=str, default="./checkpoints_bc_managed")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -287,7 +339,6 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--resume", type=str, default=None, help="从checkpoint继续训练（例如: ./checkpoints_bc_managed/best.pt）")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -312,19 +363,6 @@ def main():
 
     # Model
     model = ResNetMLPPolicy(out_dim=7).to(device)
-    
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    if args.resume:
-        if os.path.exists(args.resume):
-            print(f"📂 从checkpoint恢复: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
-            model.load_state_dict(checkpoint['model'])
-            start_epoch = checkpoint.get('epoch', 0) + 1  # 从下一个epoch开始
-            print(f"   已加载epoch {checkpoint.get('epoch', 0)}的模型")
-            print(f"   验证MSE: {checkpoint.get('val_mse', 'N/A')}")
-        else:
-            print(f"⚠️ 警告: checkpoint文件不存在: {args.resume}，将从头开始训练")
 
     # Phase 1: freeze backbone, train head
     freeze_backbone(model, freeze=True)
@@ -336,27 +374,18 @@ def main():
     # Logging
     metrics_csv = os.path.join(args.out_dir, "metrics.csv")
     metrics_jsonl = os.path.join(args.out_dir, "metrics.jsonl")
-    
-    # 如果resume，追加模式；否则覆盖模式（写入表头）
-    if not args.resume or start_epoch == 0:
-        with open(metrics_csv, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "epoch", "phase", "train_loss",
-                "val_mse", "val_cos", "val_norm_gt", "val_norm_pred",
-                "lr"
-            ] + [f"val_rmse_j{i+1}" for i in range(7)])
-    # also dump config (always overwrite)
+    with open(metrics_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "epoch", "phase", "train_loss",
+            "val_mse", "val_cos", "val_norm_gt", "val_norm_pred",
+            "lr"
+        ] + [f"val_rmse_j{i+1}" for i in range(7)])
+    # also dump config
     with open(os.path.join(args.out_dir, "run_args.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    # 如果resume，从checkpoint中恢复best_val；否则初始化为inf
-    if args.resume and os.path.exists(args.resume):
-        checkpoint = torch.load(args.resume, map_location=device)
-        best_val = checkpoint.get('val_mse', float("inf"))
-        print(f"   当前最佳验证MSE: {best_val:.6f}")
-    else:
-        best_val = float("inf")
+    best_val = float("inf")
     best_path = os.path.join(args.out_dir, "best.pt")
 
     # store history for plotting
@@ -374,7 +403,7 @@ def main():
 
     start_time = time.time()
 
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(args.epochs):
         # switch phase
         if epoch < args.freeze_epochs:
             phase = "head_only"

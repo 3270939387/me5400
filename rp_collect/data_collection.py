@@ -163,6 +163,111 @@ def check_workspace_constraint(ee_pos_base):
     
     return True, "OK"
 
+def compute_marker_geometry(marker_world_pos, camera_world_pos, camera_quat, camera_intrinsics, img_resolution):
+    """
+    计算marker在相机图像坐标系中的几何信息 (u, v, s)
+    
+    Args:
+        marker_world_pos: marker的世界坐标 [x, y, z]
+        camera_world_pos: 相机的世界坐标 [x, y, z]
+        camera_quat: 相机的世界四元数 (w, x, y, z)
+        camera_intrinsics: 相机内参 {'fx': float, 'fy': float, 'cx': float, 'cy': float}
+        img_resolution: 图像分辨率 (width, height)
+    
+    Returns:
+        dict: {
+            "visible": bool,  # marker是否在相机视野内
+            "u": float,       # marker中心的像素X坐标（归一化到[0, W)）
+            "v": float,       # marker中心的像素Y坐标（归一化到[0, H)）
+            "s": float,       # marker的尺度（1/depth，用于尺度信息）
+            "Zc": float,      # marker在相机坐标系下的深度
+            "marker_cam": [float, float, float]  # marker在相机坐标系下的坐标
+        }
+    """
+    try:
+        marker_world_pos = np.array([float(marker_world_pos[0]), float(marker_world_pos[1]), float(marker_world_pos[2])], dtype=np.float32)
+        camera_world_pos = np.array([float(camera_world_pos[0]), float(camera_world_pos[1]), float(camera_world_pos[2])], dtype=np.float32)
+        
+        # 构建相机的旋转矩阵（从world到camera）
+        # 相机四元数格式：(w, x, y, z)
+        w, qx, qy, qz = float(camera_quat[0]), float(camera_quat[1]), float(camera_quat[2]), float(camera_quat[3])
+        
+        # 四元数转旋转矩阵
+        # q = w + x*i + y*j + z*k
+        # R = [[1-2(y²+z²), 2(xy-zw), 2(xz+yw)],
+        #      [2(xy+zw), 1-2(x²+z²), 2(yz-xw)],
+        #      [2(xz-yw), 2(yz+xw), 1-2(x²+y²)]]
+        R_world_to_cam = np.array([
+            [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qz*w), 2*(qx*qz + qy*w)],
+            [2*(qx*qy + qz*w), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*w)],
+            [2*(qx*qz - qy*w), 2*(qy*qz + qx*w), 1 - 2*(qx**2 + qy**2)]
+        ], dtype=np.float32)
+        
+        # marker在相机坐标系下的坐标
+        # p_cam = R * (p_world - t)
+        p_relative = marker_world_pos - camera_world_pos
+        p_cam = R_world_to_cam @ p_relative
+        
+        Xc, Yc, Zc = p_cam[0], p_cam[1], p_cam[2]
+        
+        # 如果marker在相机后面，标记为不可见
+        if Zc <= 0.01:  # 0.01m的最小深度阈值
+            return {
+                "visible": False,
+                "u": -1.0,
+                "v": -1.0,
+                "s": 0.0,
+                "Zc": float(Zc),
+                "marker_cam": [float(Xc), float(Yc), float(Zc)]
+            }
+        
+        # 针孔相机模型投影
+        # u = cx + fx * X / Z
+        # v = cy + fy * Y / Z
+        fx = camera_intrinsics.get('fx', 640.0)
+        fy = camera_intrinsics.get('fy', 640.0)
+        cx = camera_intrinsics.get('cx', 640.0)
+        cy = camera_intrinsics.get('cy', 360.0)
+        
+        u = cx + fx * (Xc / Zc)
+        v = cy + fy * (Yc / Zc)
+        
+        img_width, img_height = img_resolution
+        
+        # 检查投影点是否在图像范围内
+        if u < 0 or u >= img_width or v < 0 or v >= img_height:
+            return {
+                "visible": False,
+                "u": float(u),
+                "v": float(v),
+                "s": 1.0 / max(Zc, 0.01),  # 仍然返回计算值，便于调试
+                "Zc": float(Zc),
+                "marker_cam": [float(Xc), float(Yc), float(Zc)]
+            }
+        
+        # s: 使用 1/Zc 作为尺度代理（深度的倒数，越近越大）
+        s = 1.0 / Zc
+        
+        return {
+            "visible": True,
+            "u": float(u),
+            "v": float(v),
+            "s": float(s),
+            "Zc": float(Zc),
+            "marker_cam": [float(Xc), float(Yc), float(Zc)]
+        }
+    
+    except Exception as e:
+        print(f"[WARN] 计算marker几何信息失败: {e}")
+        return {
+            "visible": False,
+            "u": -1.0,
+            "v": -1.0,
+            "s": 0.0,
+            "Zc": -1.0,
+            "marker_cam": [-1.0, -1.0, -1.0]
+        }
+
 def sample_valid_initial_config(robot, sim, max_attempts=100):
     """
     使用拒绝采样找到工作空间内的有效初始配置
@@ -336,8 +441,24 @@ def main():
     policy = ArticulationMotionPolicy(robot, rmp)
     target_prim = XFormPrim(MARKER_PATH)
     
-    # 相机
+    # 相机  
     cam = ViewportCamera(CAM_PATH)
+    
+    # ========== 设置相机内参（针孔相机模型）==========
+    # 这里需要匹配实际的相机参数
+    # D405是RealSense摄像头，查询其内参或从USD配置中读取
+    # 为简化起见，这里使用标准值（在实际应用中应从相机配置读取）
+    # 
+    # 标准值基于1280×720分辨率下的D405内参：
+    # 实际值应根据仿真中的相机配置调整
+    img_resolution = (1280, 720)  # 图像分辨率 (width, height)
+    camera_intrinsics = {
+        'fx': 640.0,   # 焦距X（像素单位）
+        'fy': 640.0,   # 焦距Y（像素单位）
+        'cx': 640.0,   # 主点X（像素坐标）
+        'cy': 360.0    # 主点Y（像素坐标）
+    }
+    print(f"✅ 相机内参设置: {camera_intrinsics}, 分辨率: {img_resolution}")
     
     # 保存基础位置用于随机化（⚠️ 只读，不再移动 marker 本身）
     # marker 永远固定在 Phantom 上，我们只对"RMPFlow 的目标点"加噪声
@@ -477,6 +598,26 @@ def main():
                 except:
                     ee_actual_pos = None
                     ee_actual_orn = None
+                
+                # ========== 计算marker的几何信息 (u, v, s) ==========
+                # 获取相机的世界位姿
+                try:
+                    cam_prim = XFormPrim(CAM_PATH)
+                    cam_world_pos, cam_world_orn = cam_prim.get_world_pose()
+                    cam_world_pos = np.array([float(cam_world_pos[0]), float(cam_world_pos[1]), float(cam_world_pos[2])])
+                    cam_world_orn = [float(cam_world_orn[0]), float(cam_world_orn[1]), float(cam_world_orn[2]), float(cam_world_orn[3])]
+                    marker_geometry = compute_marker_geometry(current_marker_pos, cam_world_pos, cam_world_orn, camera_intrinsics, img_resolution)
+                except Exception as e:
+                    print(f"   [WARN] 无法计算marker几何信息: {e}")
+                    marker_geometry = {
+                        "visible": False,
+                        "u": -1.0,
+                        "v": -1.0,
+                        "s": 0.0,
+                        "Zc": -1.0,
+                        "marker_cam": [-1.0, -1.0, -1.0]
+                    }
+                
                 step_data = {
                     "step": step,
                     "image_path": img_filename,
@@ -491,7 +632,8 @@ def main():
                         "command_positions": command_q,
                         "command_velocities": action.joint_velocities,
                         "delta_q": delta_q
-                    }
+                    },
+                    "marker": marker_geometry  # ✅ 新增：marker的几何信息 (u, v, s, visible, Zc)
                 }
                 episode_metadata.append(step_data)
 
@@ -531,6 +673,24 @@ def main():
                     except:
                         ee_actual_pos = None
                         ee_actual_orn = None
+                    
+                    # ========== 计算marker的几何信息 (u, v, s) ==========
+                    try:
+                        cam_prim = XFormPrim(CAM_PATH)
+                        cam_world_pos, cam_world_orn = cam_prim.get_world_pose()
+                        cam_world_pos = np.array([float(cam_world_pos[0]), float(cam_world_pos[1]), float(cam_world_pos[2])])
+                        cam_world_orn = [float(cam_world_orn[0]), float(cam_world_orn[1]), float(cam_world_orn[2]), float(cam_world_orn[3])]
+                        marker_geometry = compute_marker_geometry(current_marker_pos, cam_world_pos, cam_world_orn, camera_intrinsics, img_resolution)
+                    except Exception as e:
+                        marker_geometry = {
+                            "visible": False,
+                            "u": -1.0,
+                            "v": -1.0,
+                            "s": 0.0,
+                            "Zc": -1.0,
+                            "marker_cam": [-1.0, -1.0, -1.0]
+                        }
+                    
                     step_data = {
                         "step": step,
                         "image_path": img_filename,
@@ -545,7 +705,8 @@ def main():
                             "command_positions": command_q,
                             "command_velocities": action.joint_velocities,
                             "delta_q": delta_q
-                        }
+                        },
+                        "marker": marker_geometry  # ✅ 新增：marker的几何信息
                     }
                     episode_metadata.append(step_data)
                     print(f"   💾 已强制保存终止帧 {step}")
@@ -599,6 +760,24 @@ def main():
                         except:
                             ee_actual_pos = None
                             ee_actual_orn = None
+                        
+                        # ========== 计算marker的几何信息 (u, v, s) ==========
+                        try:
+                            cam_prim = XFormPrim(CAM_PATH)
+                            cam_world_pos, cam_world_orn = cam_prim.get_world_pose()
+                            cam_world_pos = np.array([float(cam_world_pos[0]), float(cam_world_pos[1]), float(cam_world_pos[2])])
+                            cam_world_orn = [float(cam_world_orn[0]), float(cam_world_orn[1]), float(cam_world_orn[2]), float(cam_world_orn[3])]
+                            marker_geometry = compute_marker_geometry(current_marker_pos, cam_world_pos, cam_world_orn, camera_intrinsics, img_resolution)
+                        except Exception as e:
+                            marker_geometry = {
+                                "visible": False,
+                                "u": -1.0,
+                                "v": -1.0,
+                                "s": 0.0,
+                                "Zc": -1.0,
+                                "marker_cam": [-1.0, -1.0, -1.0]
+                            }
+                        
                         step_data = {
                             "step": end_step,
                             "image_path": img_filename,
@@ -613,7 +792,8 @@ def main():
                                 "command_positions": command_q,
                                 "command_velocities": np.zeros(7),
                                 "delta_q": delta_q
-                            }
+                            },
+                            "marker": marker_geometry  # ✅ 新增：marker的几何信息
                         }
                         episode_metadata.append(step_data)
                         print(f"   💾 已强制保存成功终止帧 {end_step}")
