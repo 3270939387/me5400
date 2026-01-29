@@ -340,16 +340,50 @@ class MarkerDataset(Dataset):
         
         # 如果marker不可见，使用默认值（0, 0, 0）
         if marker_visible < 0.5:
-            marker_u = 0.0
-            marker_v = 0.0
-            marker_s = 0.0
+            marker_u_norm = 0.5  # 归一化后的中心值
+            marker_v_norm = 0.5
+            marker_s_norm = 0.0
         else:
-            marker_u = float(marker_info.get("u", 0.0))
-            marker_v = float(marker_info.get("v", 0.0))
-            marker_s = float(marker_info.get("s", 0.0))
+            # marker坐标是在原始分辨率 1280×720 下计算的
+            marker_u_orig = float(marker_info.get("u", 0.0))
+            marker_v_orig = float(marker_info.get("v", 0.0))
+            marker_s_orig = float(marker_info.get("s", 0.0))
+            
+            # ========== 归一化 u, v 到 [0, 1] ==========
+            # 这样做的好处：
+            #   1. 与图像分辨率无关（无论原始分辨率是1280×720还是其他）
+            #   2. 与训练时的缩放分辨率也无关（无论resize到240×320还是其他）
+            #   3. 网络输入尺度稳定，有利于训练收敛
+            
+            # 原始分辨率（数据采集时固定为1280×720）
+            orig_width = 1280.0
+            orig_height = 720.0
+            
+            # 归一化到 [0, 1]
+            # u_norm = u_pixel / image_width
+            # v_norm = v_pixel / image_height
+            marker_u_norm = np.clip(marker_u_orig / orig_width, 0.0, 1.0)
+            marker_v_norm = np.clip(marker_v_orig / orig_height, 0.0, 1.0)
+            
+            # ========== 归一化 s (深度倒数) ==========
+            # s = 1/Zc，其中Zc是marker在相机坐标系下的深度
+            # 深度通常在 0.2m ~ 2.0m 范围内
+            # 因此 s = 1/Z 范围在 0.5 ~ 5.0
+            # 我们做截断和归一化，使其在 [0, 1] 范围内
+            
+            s_min = 0.5  # 对应最远的物体 (Z = 2.0m)
+            s_max = 5.0  # 对应最近的物体 (Z = 0.2m)
+            
+            # 截断到有效范围
+            marker_s_clipped = np.clip(marker_s_orig, s_min, s_max)
+            
+            # 归一化到 [0, 1]
+            marker_s_norm = (marker_s_clipped - s_min) / (s_max - s_min)
         
-        # 构建marker_uvs张量
-        marker_uvs = np.array([marker_u, marker_v, marker_s], dtype=np.float32)
+        # 构建marker_uvs张量 - 都是 [0, 1] 范围内的归一化值
+        # u_norm, v_norm: marker在图像中的相对位置 [0, 1]
+        # s_norm: marker相对距离的指示 [0, 1]（0=远, 1=近）
+        marker_uvs = np.array([marker_u_norm, marker_v_norm, marker_s_norm], dtype=np.float32)
 
         # ========== 第六步：返回数据字典 ==========
         # 将处理好的数据打包成字典返回
