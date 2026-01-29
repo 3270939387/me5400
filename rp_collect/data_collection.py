@@ -211,10 +211,13 @@ def compute_marker_geometry(marker_world_pos, camera_world_pos, camera_quat, cam
         
         Xc, Yc, Zc = p_cam[0], p_cam[1], p_cam[2]
         
+        # 注意：Isaac Sim 使用 OpenGL 风格的相机坐标系，其中 -Z 指向相机前方（物体方向）
+        # 标准针孔相机模型中 +Z 指向物体方向
+        # 因此需要反向 Zc
+        Zc = -Zc
+        
         # 如果marker在相机后面，标记为不可见
-        # 在OpenGL风格的相机坐标系中，+Z指向相机后方
-        # 标准针孔相机坐标系中，+Z指向物体方向
-        # 如果Zc <= 0（物体在相机背后），则不可见
+        # 现在 Zc > 0 表示物体在相机前方（可见）
         if Zc <= 0.01:  # 0.01m的最小深度阈值
             return {
                 "visible": False,
