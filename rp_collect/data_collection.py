@@ -211,10 +211,18 @@ def compute_marker_geometry(marker_world_pos, camera_world_pos, camera_quat, cam
         
         Xc, Yc, Zc = p_cam[0], p_cam[1], p_cam[2]
         
-        # 注意：Isaac Sim 使用 OpenGL 风格的相机坐标系，其中 -Z 指向相机前方（物体方向）
-        # 标准针孔相机模型中 +Z 指向物体方向
-        # 因此需要反向 Zc
-        Zc = -Zc
+        # 注意：Isaac Sim 使用 OpenGL 风格的相机坐标系
+        # 标准针孔相机坐标系 vs Isaac Sim OpenGL坐标系的对应关系：
+        # 
+        # 标准针孔相机（计算机视觉）：
+        #   +X → 右，+Y → 下，+Z → 前（物体方向）
+        #
+        # Isaac Sim (OpenGL):
+        #   +X → 右，+Y → 上（反向），-Z → 前（物体方向，反向）
+        #
+        # 因此需要进行坐标系转换：
+        Yc = -Yc   # Y轴反向：Isaac Sim的+Y对应标准的-Y
+        Zc = -Zc   # Z轴反向：Isaac Sim的-Z对应标准的+Z
         
         # 如果marker在相机后面，标记为不可见
         # 现在 Zc > 0 表示物体在相机前方（可见）
@@ -224,6 +232,8 @@ def compute_marker_geometry(marker_world_pos, camera_world_pos, camera_quat, cam
                 "u": -1.0,
                 "v": -1.0,
                 "s": 0.0,
+                "u_raw": -1.0,
+                "v_raw": -1.0,
                 "Zc": float(Zc),
                 "marker_cam": [float(Xc), float(Yc), float(Zc)]
             }
@@ -241,25 +251,70 @@ def compute_marker_geometry(marker_world_pos, camera_world_pos, camera_quat, cam
         
         img_width, img_height = img_resolution
         
-        # 检查投影点是否在图像范围内
-        if u < 0 or u >= img_width or v < 0 or v >= img_height:
+        # ========== 处理超出范围的投影 ==========
+        # 当marker距离相机很近时，投影坐标可能会非常大（u, v > 10000）
+        # 这会导致网络输入不稳定。需要进行截断和归一化处理。
+        
+        # 1. 首先检查投影是否在合理范围内
+        #    合理范围：[-2倍图像宽度, 3倍图像宽度]（允许marker部分超出图像范围）
+        reasonable_u_min = -2.0 * img_width
+        reasonable_u_max = 3.0 * img_width
+        reasonable_v_min = -2.0 * img_height
+        reasonable_v_max = 3.0 * img_height
+        
+        # 如果投影完全超出合理范围，标记为不可见
+        if u < reasonable_u_min or u > reasonable_u_max or v < reasonable_v_min or v > reasonable_v_max:
             return {
                 "visible": False,
-                "u": float(u),
-                "v": float(v),
-                "s": 1.0 / max(Zc, 0.01),  # 仍然返回计算值，便于调试
+                "u": -1.0,
+                "v": -1.0,
+                "s": 0.0,
+                "u_raw": float(u),
+                "v_raw": float(v),
                 "Zc": float(Zc),
                 "marker_cam": [float(Xc), float(Yc), float(Zc)]
             }
         
-        # s: 使用 1/Zc 作为尺度代理（深度的倒数，越近越大）
-        s = 1.0 / Zc
+        # 2. 归一化 u, v 到 [0, 1]（基于原始图像分辨率）
+        #    即使投影超出范围，也会映射到合理的范围
+        u_norm = u / img_width
+        v_norm = v / img_height
+        
+        # 3. 截断到 [-1.5, 2.5] 范围
+        #    这允许marker在图像边界附近也有有效的坐标表示
+        #    -1.5 ~ 2.5 映射到归一化空间表示：
+        #      -1.5: marker在图像左边1.5倍宽度处
+        #       0.0: marker在图像左边界处
+        #       0.5: marker在图像中心
+        #       1.0: marker在图像右边界处
+        #       2.5: marker在图像右边2.5倍宽度处
+        u_norm_clipped = np.clip(u_norm, -1.5, 2.5)
+        v_norm_clipped = np.clip(v_norm, -1.5, 2.5)
+        
+        # 4. 处理深度和尺度信息
+        #    当Z很小时，s = 1/Z 会变得非常大，导致数值不稳定
+        #    方案：使用深度截断 + 归一化
+        
+        # 深度截断：确保最小深度为 0.05m（5cm）
+        Z_min = 0.05  # 最小深度5cm
+        Z_clipped = max(Zc, Z_min)
+        
+        # s = 1/Z，但要截断
+        # 通常深度范围是 0.05m ~ 2.0m，所以 s 范围大约是 0.5 ~ 20
+        s = 1.0 / Z_clipped
+        s_max = 20.0  # 深度倒数的上限
+        s_norm = np.clip(s, 0.0, s_max) / s_max  # 归一化到 [0, 1]
+        
+        # 检查投影是否在图像范围内（定义可见性）
+        is_in_image = (u >= 0 and u < img_width and v >= 0 and v < img_height)
         
         return {
-            "visible": True,
-            "u": float(u),
-            "v": float(v),
-            "s": float(s),
+            "visible": bool(is_in_image),
+            "u": float(u_norm_clipped),          # 归一化后的u
+            "v": float(v_norm_clipped),          # 归一化后的v
+            "s": float(s_norm),                  # 归一化后的尺度
+            "u_raw": float(u),                   # 原始像素坐标u
+            "v_raw": float(v),                   # 原始像素坐标v
             "Zc": float(Zc),
             "marker_cam": [float(Xc), float(Yc), float(Zc)]
         }
@@ -271,6 +326,8 @@ def compute_marker_geometry(marker_world_pos, camera_world_pos, camera_quat, cam
             "u": -1.0,
             "v": -1.0,
             "s": 0.0,
+            "u_raw": -1.0,
+            "v_raw": -1.0,
             "Zc": -1.0,
             "marker_cam": [-1.0, -1.0, -1.0]
         }
@@ -642,21 +699,9 @@ def main():
                     }
                 
                 step_data = {
-                    "step": step,
                     "image_path": img_filename,
-                    "state": {
-                        "q": q_current,
-                        "dq": dq_current,
-                        "ee_target_pos": vec3_to_list(target_pose_world),
-                        "ee_actual_pos": vec3_to_list(ee_actual_pos) if ee_actual_pos is not None else None,
-                        "marker_pos_world": vec3_to_list(current_marker_pos)
-                    },
-                    "action": {
-                        "command_positions": command_q,
-                        "command_velocities": action.joint_velocities,
-                        "delta_q": delta_q
-                    },
-                    "marker": marker_geometry  # ✅ 新增：marker的几何信息 (u, v, s, visible, Zc)
+                    "delta_q": delta_q.tolist(),  # ✅ BC的训练标签
+                    "marker": marker_geometry      # ✅ marker几何信息: u,v(归一化), u_raw,v_raw(原始), s, visible
                 }
                 episode_metadata.append(step_data)
 
@@ -715,21 +760,9 @@ def main():
                         }
                     
                     step_data = {
-                        "step": step,
                         "image_path": img_filename,
-                        "state": {
-                            "q": q_current,
-                            "dq": dq_current,
-                            "ee_target_pos": vec3_to_list(target_pose_world),
-                            "ee_actual_pos": vec3_to_list(ee_actual_pos) if ee_actual_pos is not None else None,
-                            "marker_pos_world": vec3_to_list(current_marker_pos)
-                        },
-                        "action": {
-                            "command_positions": command_q,
-                            "command_velocities": action.joint_velocities,
-                            "delta_q": delta_q
-                        },
-                        "marker": marker_geometry  # ✅ 新增：marker的几何信息
+                        "delta_q": delta_q.tolist(),  # ✅ BC的训练标签
+                        "marker": marker_geometry      # ✅ marker几何信息
                     }
                     episode_metadata.append(step_data)
                     print(f"   💾 已强制保存终止帧 {step}")
@@ -802,21 +835,9 @@ def main():
                             }
                         
                         step_data = {
-                            "step": end_step,
                             "image_path": img_filename,
-                            "state": {
-                                "q": q_current,
-                                "dq": dq_current,
-                                "ee_target_pos": vec3_to_list(current_marker_pos + np.array(TARGET_OFFSET)),
-                                "ee_actual_pos": vec3_to_list(ee_actual_pos) if ee_actual_pos is not None else None,
-                                "marker_pos_world": vec3_to_list(current_marker_pos)
-                            },
-                            "action": {
-                                "command_positions": command_q,
-                                "command_velocities": np.zeros(7),
-                                "delta_q": delta_q
-                            },
-                            "marker": marker_geometry  # ✅ 新增：marker的几何信息
+                            "delta_q": delta_q.tolist(),  # ✅ BC的训练标签
+                            "marker": marker_geometry      # ✅ marker几何信息
                         }
                         episode_metadata.append(step_data)
                         print(f"   💾 已强制保存成功终止帧 {end_step}")
