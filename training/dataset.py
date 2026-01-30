@@ -3,14 +3,33 @@ MarkerDataset - 机器人视觉模仿学习数据集加载器
 
 这个类负责从磁盘加载机器人任务执行数据，包括：
 - 图像：RGB相机拍摄的场景图像
-- 动作：机器人关节增量命令（delta_q_cmd）
-- 状态：当前关节位置等信息
+- 动作：机器人关节增量命令（delta_q）
+- 标记：marker在相机图像中的几何信息（u, v, s）
 
-数据结构：
+新的简化数据结构：
     DATA/
-      ├─ metadata/episode_XXXX.json  (每个episode的元数据，包含所有时间步的状态和动作)
-      └─ picture_data/episode_XXXX/  (每个episode的图像文件夹)
-          └─ frame_YYYY.png          (每个时间步对应的图像)
+      ├─ success/
+      │   ├─ metadata/episode_XXXX.json  (成功的episodes)
+      │   └─ picture_data/episode_XXXX/frame_YYYY.png
+      └─ fail/
+          ├─ metadata/episode_XXXX.json  (失败的episodes)
+          └─ picture_data/episode_XXXX/frame_YYYY.png
+
+每个step_data的格式（已简化）：
+    {
+        "image_path": "frame_0000.png",
+        "delta_q": [0.05, -0.02, 0.01, ...],  // 7维关节动作
+        "marker": {
+            "visible": true,
+            "u": 0.50,                  // 归一化x坐标 [-1.5, 2.5]
+            "v": 0.45,                  // 归一化y坐标 [-1.5, 2.5]
+            "s": 0.25,                  // 归一化尺度 [0, 1]
+            "u_raw": 640.0,             // 原始像素x坐标（用于调试）
+            "v_raw": 360.0,             // 原始像素y坐标（用于调试）
+            "Zc": 0.80,                 // 深度信息（米）
+            "marker_cam": [0.05, -0.02, 0.80]  // 相机坐标系3D位置
+        }
+    }
 """
 
 import os
@@ -171,10 +190,9 @@ class MarkerDataset(Dataset):
                 # 这是数据质量保证的关键步骤！
                 # 
                 # 1. 提取动作向量
-                #    优先使用delta_q（当前命令 - 当前状态，经典的BC监督信号）
-                #    如果没有，则回退到delta_q_cmd（兼容旧数据）
-                action = step_data.get("action", {})
-                delta_q_raw = action.get("delta_q", action.get("delta_q_cmd", []))
+                #    新的简化数据格式：delta_q直接在step_data顶层
+                #    例如：step_data = {"image_path": "...", "delta_q": [...], "marker": {...}}
+                delta_q_raw = step_data.get("delta_q", [])
                 delta_q_arr = np.array(delta_q_raw, dtype=np.float32)
                 
                 # 2. 检查动作是否为空或包含NaN/Inf
@@ -275,14 +293,16 @@ class MarkerDataset(Dataset):
             dict: 包含以下键值对：
                 - "image": torch.Tensor, 形状 [3, H, W]，预处理后的图像
                 - "delta_q": torch.Tensor, 形状 [7]，动作向量（关节增量命令）
-                - "joint_positions": torch.Tensor, 形状 [7]，当前关节位置
+                - "joint_positions": torch.Tensor, 形状 [7]，当前关节位置（新格式中为零）
+                - "marker_uvs": torch.Tensor, 形状 [3]，marker的(u_norm, v_norm, s_norm)
+                - "marker_visible": torch.Tensor, 形状 [1]，marker是否可见的标志
                 - "raw": dict，原始step_data（便于调试和扩展）
         
         工作流程：
             1. 根据索引获取样本信息
             2. 加载并预处理图像
-            3. 提取并处理动作向量
-            4. 提取关节位置（可选）
+            3. 提取动作向量（delta_q）
+            4. 提取marker几何信息（u, v, s）
             5. 转换为PyTorch张量并返回
         """
         # ========== 第一步：获取样本信息 ==========
@@ -307,11 +327,9 @@ class MarkerDataset(Dataset):
             raise RuntimeError(f"加载图像失败 {img_path}: {e}") from e
 
         # ========== 第三步：提取动作向量 ==========
-        # 动作目标：优先使用delta_q（当前命令 - 当前状态，经典的BC监督信号）
-        # 如果没有，则回退到delta_q_cmd（兼容旧数据）
-        action = step_data.get("action", {})
-        delta_q = action.get("delta_q", action.get("delta_q_cmd", []))
-        delta_q = np.array(delta_q, dtype=np.float32)
+        # 新的简化数据格式：delta_q直接在step_data顶层
+        # 例如：step_data = {"image_path": "...", "delta_q": [...], "marker": {...}}
+        delta_q = np.array(step_data.get("delta_q", []), dtype=np.float32)
         
         # 确保动作向量长度为7（7个关节）
         # 如果长度不足7，用0填充；如果超过7，截断到7
@@ -325,63 +343,37 @@ class MarkerDataset(Dataset):
             delta_q = np.pad(delta_q, (0, max(0, 7 - delta_q.shape[0])), 'constant')[:7]
 
         # ========== 第四步：提取关节位置（可选信息） ==========
+        # 新的简化数据格式中没有state信息，使用默认全零
         # 某些模型可能需要当前状态作为输入（例如：状态-动作联合预测）
         # 这里提取当前关节位置q（7个关节的角度）
-        state = step_data.get("state", {})
-        q = np.array(state.get("q", [0.0] * 7), dtype=np.float32)  # 如果没有，默认全零
-        if q.shape[0] != 7:
-            q = np.pad(q, (0, max(0, 7 - q.shape[0])), 'constant')[:7]  # 同样pad/cut到7维
+        q = np.array([0.0] * 7, dtype=np.float32)  # 新格式中没有state，使用默认值
 
         # ========== 第五步：提取marker几何信息 (u, v, s) ==========
-        # 从step_data中读取marker信息，用于显式建模几何约束
-        # 格式：{"visible": bool, "u": float, "v": float, "s": float, "Zc": float, ...}
+        # 新的简化数据格式：marker直接在step_data中
+        # 格式：{"visible": bool, "u": float, "v": float, "s": float, "u_raw": float, "v_raw": float, "Zc": float, ...}
         marker_info = step_data.get("marker", {})
         marker_visible = float(marker_info.get("visible", False))  # 1.0 or 0.0
         
-        # 如果marker不可见，使用默认值（0, 0, 0）
+        # 如果marker不可见，使用默认值（0.5, 0.5, 0）表示中心、无深度信息
         if marker_visible < 0.5:
             marker_u_norm = 0.5  # 归一化后的中心值
             marker_v_norm = 0.5
             marker_s_norm = 0.0
         else:
-            # marker坐标是在原始分辨率 1280×720 下计算的
-            marker_u_orig = float(marker_info.get("u", 0.0))
-            marker_v_orig = float(marker_info.get("v", 0.0))
-            marker_s_orig = float(marker_info.get("s", 0.0))
+            # marker的u, v已经是归一化后的值 [-1.5, 2.5]
+            # s已经是归一化后的值 [0, 1]
+            # 直接使用即可！
+            marker_u_norm = float(marker_info.get("u", 0.5))
+            marker_v_norm = float(marker_info.get("v", 0.5))
+            marker_s_norm = float(marker_info.get("s", 0.0))
             
-            # ========== 归一化 u, v 到 [0, 1] ==========
-            # 这样做的好处：
-            #   1. 与图像分辨率无关（无论原始分辨率是1280×720还是其他）
-            #   2. 与训练时的缩放分辨率也无关（无论resize到240×320还是其他）
-            #   3. 网络输入尺度稳定，有利于训练收敛
-            
-            # 原始分辨率（数据采集时固定为1280×720）
-            orig_width = 1280.0
-            orig_height = 720.0
-            
-            # 归一化到 [0, 1]
-            # u_norm = u_pixel / image_width
-            # v_norm = v_pixel / image_height
-            marker_u_norm = np.clip(marker_u_orig / orig_width, 0.0, 1.0)
-            marker_v_norm = np.clip(marker_v_orig / orig_height, 0.0, 1.0)
-            
-            # ========== 归一化 s (深度倒数) ==========
-            # s = 1/Zc，其中Zc是marker在相机坐标系下的深度
-            # 深度通常在 0.2m ~ 2.0m 范围内
-            # 因此 s = 1/Z 范围在 0.5 ~ 5.0
-            # 我们做截断和归一化，使其在 [0, 1] 范围内
-            
-            s_min = 0.5  # 对应最远的物体 (Z = 2.0m)
-            s_max = 5.0  # 对应最近的物体 (Z = 0.2m)
-            
-            # 截断到有效范围
-            marker_s_clipped = np.clip(marker_s_orig, s_min, s_max)
-            
-            # 归一化到 [0, 1]
-            marker_s_norm = (marker_s_clipped - s_min) / (s_max - s_min)
+            # 再次确保在合理范围内（防御式编程）
+            marker_u_norm = np.clip(marker_u_norm, -1.5, 2.5)
+            marker_v_norm = np.clip(marker_v_norm, -1.5, 2.5)
+            marker_s_norm = np.clip(marker_s_norm, 0.0, 1.0)
         
-        # 构建marker_uvs张量 - 都是 [0, 1] 范围内的归一化值
-        # u_norm, v_norm: marker在图像中的相对位置 [0, 1]
+        # 构建marker_uvs张量 - 都是经过处理的归一化值
+        # u_norm, v_norm: marker在图像中的相对位置 [-1.5, 2.5]（允许超出图像边界）
         # s_norm: marker相对距离的指示 [0, 1]（0=远, 1=近）
         marker_uvs = np.array([marker_u_norm, marker_v_norm, marker_s_norm], dtype=np.float32)
 
