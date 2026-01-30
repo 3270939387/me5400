@@ -115,31 +115,36 @@ def make_loaders(dataset_root, batch_size=64, num_workers=4, image_size_hw=(240,
 
 class ResNetMLPPolicy(nn.Module):
     """
-    ResNet18 + MLP 策略网络，支持 marker 几何信息 (u, v, s)
+    ResNet18 + MLP 策略网络，支持完整的状态信息
     
     输入：
-      - image: [B, 3, H, W] - RGB图像
+      - image: [B, 3, H, W] - RGB相机图像
+      - q: [B, 7] - 当前关节位置（proprioceptive state）
       - marker_geom: [B, 3] - marker的(u, v, s) 信息
+      - marker_visible: [B, 1] - marker可见性标志
     
     前向过程：
       1. ResNet18 backbone 提取图像特征 → [B, 512]
-      2. 将marker_geom拼接到特征向量 → [B, 515]
+      2. 拼接所有状态信息 → [B, 512+7+3+1 = 523]
       3. MLP 处理拼接后的特征 → [B, 7]（delta_q）
     
-    优点：
-      - 显式加入marker的几何信息，减少多解问题
-      - 模型能够学习图像特征和几何约束的联合表示
-      - 简单高效，无需改变基础的BC框架
+    设计理由：
+      - q：解决非Markovian问题（同一图像可能对应不同关节配置）
+      - marker_geom：显式提供视觉伺服的几何约束（visible=1时有效）
+      - marker_visible：显式告诉网络几何信息是否可靠（critical!)
+      - 这样模型能学到两种策略：有marker时精细伺服，无marker时搜索+q补偿
     """
-    def __init__(self, out_dim=7, marker_geom_dim=3):
+    def __init__(self, out_dim=7, marker_geom_dim=3, q_dim=7, use_visible=True):
         super().__init__()
         # ResNet18 backbone (去掉最后的全连接层)
         backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])  # [B,512,1,1]
         
-        # MLP head: 拼接图像特征和marker几何信息
-        # 输入维度 = image_features (512) + marker_geom (3) = 515
-        mlp_input_dim = 512 + marker_geom_dim
+        self.use_visible = use_visible
+        # MLP head 拼接所有信息
+        # 输入维度 = image_features (512) + q (7) + marker_geom (3) + visible (0 or 1)
+        extra_dim = marker_geom_dim + q_dim + (1 if use_visible else 0)
+        mlp_input_dim = 512 + extra_dim
         
         self.head = nn.Sequential(
             nn.Linear(mlp_input_dim, 256),
@@ -149,24 +154,51 @@ class ResNetMLPPolicy(nn.Module):
             nn.Linear(128, out_dim),
         )
 
-    def forward(self, x, marker_geom=None):
+    def forward(self, x, q=None, marker_geom=None, marker_visible=None):
         """
         前向传播
         
         Args:
             x: [B, 3, H, W] - RGB图像
+            q: [B, 7] - 当前关节位置，或None
             marker_geom: [B, 3] - marker的(u, v, s)信息，或None
+                - 当marker不可见时，uvs已被清零为[0, 0, 0]
+            marker_visible: [B, 1] - marker可见性标志，或None
+                - 1.0: marker可见，uvs有效
+                - 0.0: marker不可见，uvs已清零
         
         Returns:
             [B, 7] - 预测的delta_q
+        
+        执行策略：
+            - 提取图像特征 [B, 512]
+            - 拼接q [B, 7] → 处理非Markovian
+            - 拼接marker_geom [B, 3] → 视觉伺服约束
+            - 拼接visible [B, 1] → 显式表达几何可靠性
+            - 通过MLP输出动作
         """
         # 提取图像特征
         feat = self.backbone(x).flatten(1)  # [B, 512]
         
-        # 如果提供了marker几何信息，拼接到特征向量
+        # 拼接q (proprioceptive state)
+        if q is not None:
+            feat = torch.cat([feat, q], dim=1)  # [B, 512+7]
+        
+        # 拼接marker_geom (uvs信息，当visible=0时已清零)
         if marker_geom is not None:
-            # marker_geom: [B, 3]
-            feat = torch.cat([feat, marker_geom], dim=1)  # [B, 515]
+            feat = torch.cat([feat, marker_geom], dim=1)  # [B, +3]
+        
+        # 拼接marker_visible (显式告诉网络几何是否可靠)
+        if self.use_visible:
+            # ⚠️ 关键：宁可crash也别默默补1
+            # 如果marker_visible是None，说明数据加载有问题
+            # 立即报错，而不是无声地创建ones张量
+            # 这样能快速定位数据流问题，而不是训练3小时才发现loss异常
+            assert marker_visible is not None, (
+                "❌ marker_visible is required when use_visible=True!\n"
+                "Check your dataset.py or dataloader - did you forget to return 'marker_visible' from __getitem__?"
+            )
+            feat = torch.cat([feat, marker_visible], dim=1)  # [B, +1]
         
         # 通过MLP head输出动作
         return self.head(feat)  # [B, 7]
@@ -192,6 +224,7 @@ def unfreeze_layer4_only(model: ResNetMLPPolicy):
 @dataclass
 class EvalStats:
     mse: float
+    weighted_mse: float  # 新增：按marker_visible加权的MSE
     rmse_per_joint: np.ndarray
     action_norm_gt_mean: float
     action_norm_pred_mean: float
@@ -203,6 +236,7 @@ def evaluate(model, loader, device) -> EvalStats:
     loss_fn = nn.MSELoss(reduction="sum")
 
     total_mse_sum = 0.0
+    total_weighted_mse_sum = 0.0  # 新增：带权重的MSE
     total_n = 0
     # per joint
     se_sum = None  # [D]
@@ -216,21 +250,42 @@ def evaluate(model, loader, device) -> EvalStats:
         images = batch["image"].to(device, non_blocking=True)
         target = batch["delta_q"].to(device, non_blocking=True)  # [B,7]
         
+        # 获取proprioceptive state（当前关节位置）
+        q = batch.get("joint_positions", None)
+        if q is not None:
+            q = q.to(device, non_blocking=True)  # [B, 7]
+        
         # 获取marker几何信息
         marker_geom = batch.get("marker_uvs", None)
         if marker_geom is not None:
             marker_geom = marker_geom.to(device, non_blocking=True)  # [B,3]
         
-        # 前向传播，传入marker几何信息
-        pred = model(images, marker_geom)
+        # 获取marker可见性标志
+        marker_visible = batch.get("marker_visible", None)
+        if marker_visible is not None:
+            marker_visible = marker_visible.to(device, non_blocking=True)  # [B, 1]
+        
+        # 前向传播，传入完整的状态信息
+        pred = model(images, q=q, marker_geom=marker_geom, marker_visible=marker_visible)
 
         mse_sum = loss_fn(pred, target).item()
         total_mse_sum += mse_sum
+        
+        # 计算加权MSE（按marker_visible权重）
+        se = (pred - target) ** 2  # [B, 7]
+        loss_per_sample = se.mean(dim=1)  # [B]，逐样本平均
+        
+        if marker_visible is not None:
+            sample_weights = 0.2 + 0.8 * marker_visible.squeeze(-1)  # [B]
+            weighted_loss_per_sample = loss_per_sample * sample_weights  # [B]
+            total_weighted_mse_sum += weighted_loss_per_sample.sum().item()
+        else:
+            total_weighted_mse_sum += loss_per_sample.sum().item()
+        
         bs = images.size(0)
         total_n += bs
 
         # per joint squared error
-        se = (pred - target) ** 2  # [B,7]
         se_batch_sum = se.sum(dim=0).detach().cpu().numpy()  # [7]
         if se_sum is None:
             se_sum = se_batch_sum
@@ -247,12 +302,14 @@ def evaluate(model, loader, device) -> EvalStats:
 
     if total_n == 0:
         return EvalStats(mse=float("nan"),
+                         weighted_mse=float("nan"),
                          rmse_per_joint=np.full((7,), np.nan),
                          action_norm_gt_mean=float("nan"),
                          action_norm_pred_mean=float("nan"),
                          cos_mean=float("nan"))
 
-    mse = total_mse_sum / (total_n * 7)  # average per-dim MSE
+    mse = total_mse_sum / (total_n * 7)  # average per-dim MSE（未加权）
+    weighted_mse = total_weighted_mse_sum / total_n  # 加权后的平均MSE
     rmse_per_joint = np.sqrt(se_sum / total_n)  # [7]
 
     gt_norms = np.concatenate(gt_norms) if len(gt_norms) else np.array([])
@@ -261,6 +318,7 @@ def evaluate(model, loader, device) -> EvalStats:
 
     return EvalStats(
         mse=float(mse),
+        weighted_mse=float(weighted_mse),
         rmse_per_joint=rmse_per_joint.astype(float),
         action_norm_gt_mean=float(gt_norms.mean()) if gt_norms.size else float("nan"),
         action_norm_pred_mean=float(pred_norms.mean()) if pred_norms.size else float("nan"),
@@ -268,24 +326,65 @@ def evaluate(model, loader, device) -> EvalStats:
     )
 
 def train_one_epoch(model, loader, optimizer, device, grad_clip: float = 0.0) -> float:
+    """
+    训练一个epoch
+    
+    注意：可以通过marker_visible来改进损失函数的权重设置。
+    例如，可以让不可见marker的样本有较低的损失权重，以避免过拟合到错误的marker值。
+    
+    改进建议（可选）：
+    ```python
+    marker_visible = batch.get("marker_visible", None)  # [B, 1]
+    if marker_visible is not None:
+        marker_visible = marker_visible.to(device)
+        # 计算带权重的损失：不可见时权重较低
+        sample_weight = 0.5 + 0.5 * marker_visible.squeeze()
+        loss = (loss_fn(pred, target) * sample_weight).mean()
+    else:
+        loss = loss_fn(pred, target)
+    ```
+    
+    但当前实现中使用-2.0哨兵值已经足够了，因为模型可以自动学习这个特殊值的含义。
+    """
     model.train()
-    loss_fn = nn.MSELoss()
     total_loss = 0.0
     n = 0
 
     pbar = tqdm(loader, desc="Train", leave=False)
     for batch in pbar:
         images = batch["image"].to(device, non_blocking=True)
-        target = batch["delta_q"].to(device, non_blocking=True)
+        target = batch["delta_q"].to(device, non_blocking=True)  # [B, 7]
+        
+        # 获取proprioceptive state（当前关节位置）
+        q = batch.get("joint_positions", None)
+        if q is not None:
+            q = q.to(device, non_blocking=True)  # [B, 7]
         
         # 获取marker几何信息
         marker_geom = batch.get("marker_uvs", None)
         if marker_geom is not None:
-            marker_geom = marker_geom.to(device, non_blocking=True)  # [B,3]
+            marker_geom = marker_geom.to(device, non_blocking=True)  # [B, 3]
+        
+        # 获取marker可见性标志
+        marker_visible = batch.get("marker_visible", None)
+        if marker_visible is not None:
+            marker_visible = marker_visible.to(device, non_blocking=True)  # [B, 1]
 
-        # 前向传播，传入marker几何信息
-        pred = model(images, marker_geom)
-        loss = loss_fn(pred, target)
+        # 前向传播，传入完整的状态信息
+        pred = model(images, q=q, marker_geom=marker_geom, marker_visible=marker_visible)
+        
+        # ========== 计算加权损失 ==========
+        # 计算逐样本的MSE损失
+        loss_per_sample = torch.mean((pred - target) ** 2, dim=1)  # [B]
+        
+        # 根据marker_visible加权：
+        # visible=1.0 → weight=1.0（完整监督，精细视觉伺服）
+        # visible=0.0 → weight=0.2（降权，搜索/稳定阶段）
+        if marker_visible is not None:
+            sample_weights = 0.2 + 0.8 * marker_visible.squeeze(-1)  # [B]
+            loss = (loss_per_sample * sample_weights).mean()
+        else:
+            loss = loss_per_sample.mean()
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -378,7 +477,7 @@ def main():
         writer = csv.writer(f)
         writer.writerow([
             "epoch", "phase", "train_loss",
-            "val_mse", "val_cos", "val_norm_gt", "val_norm_pred",
+            "val_mse", "val_weighted_mse", "val_cos", "val_norm_gt", "val_norm_pred",
             "lr"
         ] + [f"val_rmse_j{i+1}" for i in range(7)])
     # also dump config
@@ -433,20 +532,22 @@ def main():
         print(
             f"Epoch {epoch:03d} [{phase}] "
             f"train_loss={train_loss:.6f} | val_mse={val_stats.mse:.6f} "
+            f"| val_weighted_mse={val_stats.weighted_mse:.6f} "
             f"| cos={val_stats.cos_mean:.3f} | lr={lr:.2e}"
         )
 
-        # scheduler uses val mse
-        scheduler.step(val_stats.mse)
+        # scheduler uses weighted val mse (emphasize visible samples)
+        scheduler.step(val_stats.weighted_mse)
 
-        # save best
-        if val_stats.mse < best_val:
-            best_val = val_stats.mse
+        # save best (based on weighted_mse to emphasize visible samples)
+        if val_stats.weighted_mse < best_val:
+            best_val = val_stats.weighted_mse
             torch.save(
                 {
                     "model": model.state_dict(),
                     "epoch": epoch,
                     "val_mse": val_stats.mse,
+                    "val_weighted_mse": val_stats.weighted_mse,
                     "args": vars(args),
                 },
                 best_path,
@@ -459,6 +560,7 @@ def main():
             "phase": phase,
             "train_loss": train_loss,
             "val_mse": val_stats.mse,
+            "val_weighted_mse": val_stats.weighted_mse,
             "val_cos": val_stats.cos_mean,
             "val_norm_gt": val_stats.action_norm_gt_mean,
             "val_norm_pred": val_stats.action_norm_pred_mean,
@@ -472,7 +574,7 @@ def main():
         with open(metrics_csv, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
-                [epoch, phase, train_loss, val_stats.mse, val_stats.cos_mean,
+                [epoch, phase, train_loss, val_stats.mse, val_stats.weighted_mse, val_stats.cos_mean,
                  val_stats.action_norm_gt_mean, val_stats.action_norm_pred_mean, lr]
                 + list(val_stats.rmse_per_joint)
             )
@@ -529,9 +631,9 @@ def main():
             out_path=os.path.join(plots_dir, "val_action_norm.png"),
         )
 
-        # early stopping on val mse
-        if early.step(val_stats.mse):
-            print(f"🛑 Early stopping triggered at epoch {epoch} (best val_mse={early.best:.6f})")
+        # early stopping on weighted val mse (emphasize visible samples)
+        if early.step(val_stats.weighted_mse):
+            print(f"🛑 Early stopping triggered at epoch {epoch} (best weighted_val_mse={early.best:.6f})")
             break
 
     elapsed = time.time() - start_time

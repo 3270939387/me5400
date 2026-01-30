@@ -4,32 +4,38 @@ MarkerDataset - 机器人视觉模仿学习数据集加载器
 这个类负责从磁盘加载机器人任务执行数据，包括：
 - 图像：RGB相机拍摄的场景图像
 - 动作：机器人关节增量命令（delta_q）
-- 标记：marker在相机图像中的几何信息（u, v, s）
+- 状态：当前关节位置（q）- 解决非Markovian歧义
+- 标记：marker在相机图像中的几何信息（u, v, s）+ 可见性标志
 
-新的简化数据结构：
+新的嵌套数据结构（与data_collection.py同步）：
     DATA/
-      ├─ success/
-      │   ├─ metadata/episode_XXXX.json  (成功的episodes)
-      │   └─ picture_data/episode_XXXX/frame_YYYY.png
-      └─ fail/
-          ├─ metadata/episode_XXXX.json  (失败的episodes)
-          └─ picture_data/episode_XXXX/frame_YYYY.png
+    ├─ metadata/episode_XXXX.json
+    └─ picture_data/episode_XXXX/frame_YYYY.png
 
-每个step_data的格式（已简化）：
+每个step_data的格式（完整）：
     {
         "image_path": "frame_0000.png",
-        "delta_q": [0.05, -0.02, 0.01, ...],  // 7维关节动作
+        "q": [0.5, 1.2, -0.3, ...],            # 7维，当前关节位置（proprioception）
+        "delta_q": [0.05, -0.02, 0.01, ...],   # 7维，动作标签
         "marker": {
-            "visible": true,
-            "u": 0.50,                  // 归一化x坐标 [-1.5, 2.5]
-            "v": 0.45,                  // 归一化y坐标 [-1.5, 2.5]
-            "s": 0.25,                  // 归一化尺度 [0, 1]
-            "u_raw": 640.0,             // 原始像素x坐标（用于调试）
-            "v_raw": 360.0,             // 原始像素y坐标（用于调试）
-            "Zc": 0.80,                 // 深度信息（米）
-            "marker_cam": [0.05, -0.02, 0.80]  // 相机坐标系3D位置
+            "uvs_normalized": {
+                "u": 0.50,                     # 归一化x坐标 [-1.5, 2.5]
+                "v": 0.45,                     # 归一化y坐标 [-1.5, 2.5]
+                "s": 0.25                      # 归一化尺度 [0, 1]（表示距离）
+            },
+            "uvs_raw": {
+                "u_raw": 640.0,                # 原始像素x坐标（用于调试）
+                "v_raw": 360.0                 # 原始像素y坐标（用于调试）
+            },
+            "visible": true,                   # bool，marker是否在视野内
+            "Zc": 0.80,                        # float，深度信息（米）
+            "marker_cam": [0.05, -0.02, 0.80] # [Xc, Yc, Zc]，相机坐标系3D位置
         }
     }
+
+数据流与学习策略：
+    visible=1 → uvs有意义 → 进入"视觉伺服模式"（fine servoing）
+    visible=0 → uvs被清零 → 只能靠图像+q做"搜索模式"（exploration）
 """
 
 import os
@@ -342,39 +348,51 @@ class MarkerDataset(Dataset):
         if delta_q.shape[0] != 7:
             delta_q = np.pad(delta_q, (0, max(0, 7 - delta_q.shape[0])), 'constant')[:7]
 
-        # ========== 第四步：提取关节位置（可选信息） ==========
-        # 新的简化数据格式中没有state信息，使用默认全零
-        # 某些模型可能需要当前状态作为输入（例如：状态-动作联合预测）
-        # 这里提取当前关节位置q（7个关节的角度）
-        q = np.array([0.0] * 7, dtype=np.float32)  # 新格式中没有state，使用默认值
+        # ========== 第四步：提取关节位置（必需信息） ==========
+        # 从新格式的step_data中提取q（关节位置/proprioceptive state）
+        # q是当前机器人关节位置，对于BC学习非常重要：
+        #   - 解决非Markovian性：同一个图像可能对应不同的关节配置，需要q来消除歧义
+        #   - 改进动作预测准确性：模型基于当前状态预测下一步动作
+        q_list = step_data.get("q", [0.0] * 7)  # 从step_data中读取，如果缺失则用零向量
+        q = np.array(q_list, dtype=np.float32)
+        
+        # 确保q的长度为7
+        if q.shape[0] != 7:
+            q = np.pad(q, (0, max(0, 7 - q.shape[0])), 'constant')[:7]
 
         # ========== 第五步：提取marker几何信息 (u, v, s) ==========
-        # 新的简化数据格式：marker直接在step_data中
-        # 格式：{"visible": bool, "u": float, "v": float, "s": float, "u_raw": float, "v_raw": float, "Zc": float, ...}
+        # 新的嵌套数据格式，匹配data_collection.py的格式
+        # 结构：marker.uvs_normalized.{u, v, s}, marker.visible等
         marker_info = step_data.get("marker", {})
-        marker_visible = float(marker_info.get("visible", False))  # 1.0 or 0.0
+        marker_visible = float(marker_info.get("visible", False))  # 0.0 or 1.0
         
-        # 如果marker不可见，使用默认值（0.5, 0.5, 0）表示中心、无深度信息
-        if marker_visible < 0.5:
-            marker_u_norm = 0.5  # 归一化后的中心值
-            marker_v_norm = 0.5
-            marker_s_norm = 0.0
-        else:
-            # marker的u, v已经是归一化后的值 [-1.5, 2.5]
-            # s已经是归一化后的值 [0, 1]
-            # 直接使用即可！
-            marker_u_norm = float(marker_info.get("u", 0.5))
-            marker_v_norm = float(marker_info.get("v", 0.5))
-            marker_s_norm = float(marker_info.get("s", 0.0))
-            
-            # 再次确保在合理范围内（防御式编程）
-            marker_u_norm = np.clip(marker_u_norm, -1.5, 2.5)
-            marker_v_norm = np.clip(marker_v_norm, -1.5, 2.5)
-            marker_s_norm = np.clip(marker_s_norm, 0.0, 1.0)
+        # 从嵌套的uvs_normalized字典中提取归一化坐标
+        uvs_normalized = marker_info.get("uvs_normalized", {})
         
-        # 构建marker_uvs张量 - 都是经过处理的归一化值
-        # u_norm, v_norm: marker在图像中的相对位置 [-1.5, 2.5]（允许超出图像边界）
-        # s_norm: marker相对距离的指示 [0, 1]（0=远, 1=近）
+        # 提取原始的marker坐标
+        marker_u_norm = float(uvs_normalized.get("u", 0.0))
+        marker_v_norm = float(uvs_normalized.get("v", 0.0))
+        marker_s_norm = float(uvs_normalized.get("s", 0.0))
+        
+        # 再次确保在合理范围内（防御式编程）
+        marker_u_norm = np.clip(marker_u_norm, -1.5, 2.5)
+        marker_v_norm = np.clip(marker_v_norm, -1.5, 2.5)
+        marker_s_norm = np.clip(marker_s_norm, 0.0, 1.0)
+        
+        # ========== 关键策略：visible=0时清零uvs ==========
+        # 当marker不可见时，将uvs设为0
+        # 这样网络能学到两种策略：
+        #   - visible=1: uvs有效 → 使用marker辅导的精细伺服（fine servoing）
+        #   - visible=0: uvs为0 → 只用图像+q做搜索/稳定动作（exploration/stabilization）
+        # 
+        # 这比使用"无效码"更稳定，因为uvs=0明确表示"无效信息"
+        # 网络不需要额外学习如何识别无效码
+        uvs_mask = marker_visible  # 0.0 or 1.0
+        marker_u_norm = marker_u_norm * uvs_mask
+        marker_v_norm = marker_v_norm * uvs_mask
+        marker_s_norm = marker_s_norm * uvs_mask
+        
+        # 构建marker_uvs张量 - 当visible=0时全为0
         marker_uvs = np.array([marker_u_norm, marker_v_norm, marker_s_norm], dtype=np.float32)
 
         # ========== 第六步：返回数据字典 ==========

@@ -699,9 +699,23 @@ def main():
                     }
                 
                 step_data = {
-                    "image_path": img_filename,
-                    "delta_q": delta_q.tolist(),  # ✅ BC的训练标签
-                    "marker": marker_geometry      # ✅ marker几何信息: u,v(归一化), u_raw,v_raw(原始), s, visible
+                    "image_path": img_filename,        # str: 图像文件名 (e.g., "frame_0000.png")
+                    "q": q_current.tolist(),           # list: 关节位置 [7] - proprioception信息
+                    "delta_q": delta_q.tolist(),       # list: 关节增量命令 [7] - BC的训练标签
+                    "marker": {
+                        "uvs_normalized": {            # 归一化后的marker几何
+                            "u": marker_geometry.get("u", -1.0),
+                            "v": marker_geometry.get("v", -1.0),
+                            "s": marker_geometry.get("s", 0.0)
+                        },
+                        "uvs_raw": {                   # 原始像素坐标（方便debug）
+                            "u_raw": marker_geometry.get("u_raw", -1.0),
+                            "v_raw": marker_geometry.get("v_raw", -1.0)
+                        },
+                        "visible": marker_geometry.get("visible", False),  # bool: marker是否可见
+                        "Zc": marker_geometry.get("Zc", -1.0),            # float: 相机坐标系中的深度
+                        "marker_cam": marker_geometry.get("marker_cam", [-1.0, -1.0, -1.0])  # [Xc, Yc, Zc]
+                    }
                 }
                 episode_metadata.append(step_data)
 
@@ -760,9 +774,23 @@ def main():
                         }
                     
                     step_data = {
-                        "image_path": img_filename,
-                        "delta_q": delta_q.tolist(),  # ✅ BC的训练标签
-                        "marker": marker_geometry      # ✅ marker几何信息
+                        "image_path": img_filename,        # str: 图像文件名
+                        "q": q_current.tolist(),           # list: 关节位置 [7] - proprioception信息
+                        "delta_q": delta_q.tolist(),       # list: 关节增量命令 [7] - BC的训练标签
+                        "marker": {
+                            "uvs_normalized": {            # 归一化后的marker几何
+                                "u": marker_geometry.get("u", -1.0),
+                                "v": marker_geometry.get("v", -1.0),
+                                "s": marker_geometry.get("s", 0.0)
+                            },
+                            "uvs_raw": {                   # 原始像素坐标（方便debug）
+                                "u_raw": marker_geometry.get("u_raw", -1.0),
+                                "v_raw": marker_geometry.get("v_raw", -1.0)
+                            },
+                            "visible": marker_geometry.get("visible", False),  # bool: marker是否可见
+                            "Zc": marker_geometry.get("Zc", -1.0),            # float: 相机坐标系中的深度
+                            "marker_cam": marker_geometry.get("marker_cam", [-1.0, -1.0, -1.0])  # [Xc, Yc, Zc]
+                        }
                     }
                     episode_metadata.append(step_data)
                     print(f"   💾 已强制保存终止帧 {step}")
@@ -835,9 +863,23 @@ def main():
                             }
                         
                         step_data = {
-                            "image_path": img_filename,
-                            "delta_q": delta_q.tolist(),  # ✅ BC的训练标签
-                            "marker": marker_geometry      # ✅ marker几何信息
+                            "image_path": img_filename,        # str: 图像文件名
+                            "q": q_current.tolist(),           # list: 关节位置 [7] - proprioception信息
+                            "delta_q": delta_q.tolist(),       # list: 关节增量命令 [7] - BC的训练标签
+                            "marker": {
+                                "uvs_normalized": {            # 归一化后的marker几何
+                                    "u": marker_geometry.get("u", -1.0),
+                                    "v": marker_geometry.get("v", -1.0),
+                                    "s": marker_geometry.get("s", 0.0)
+                                },
+                                "uvs_raw": {                   # 原始像素坐标（方便debug）
+                                    "u_raw": marker_geometry.get("u_raw", -1.0),
+                                    "v_raw": marker_geometry.get("v_raw", -1.0)
+                                },
+                                "visible": marker_geometry.get("visible", False),  # bool: marker是否可见
+                                "Zc": marker_geometry.get("Zc", -1.0),            # float: 相机坐标系中的深度
+                                "marker_cam": marker_geometry.get("marker_cam", [-1.0, -1.0, -1.0])  # [Xc, Yc, Zc]
+                            }
                         }
                         episode_metadata.append(step_data)
                         print(f"   💾 已强制保存成功终止帧 {end_step}")
