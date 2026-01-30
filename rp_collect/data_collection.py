@@ -63,6 +63,35 @@ WORKSPACE_RADIUS = 0.30  # 米（30cm，从25cm扩大）
 WORKSPACE_Z_MIN = 0.15  # 米（从0.20降低）
 WORKSPACE_Z_MAX = 0.80  # 米（从0.75增加）
 
+# ===================== 预定义的中立姿态（Neutral Poses）=====================
+# 这些姿态是从人工演示中精选的，覆盖工作空间的各个角度
+# 在每个episode中，我们会随机选择一个neutral pose，然后添加小扰动
+NEUTRAL_POSES = [
+    [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785],   # 01. 标准 Home
+    [0.0, -0.500, 0.0, -2.000, 0.0, 1.500, 0.785],   # 02. 略高俯视
+    [0.0, -1.000, 0.0, -2.500, 0.0, 1.700, 0.785],   # 03. 略低平视
+    [0.4, -0.785, 0.2, -2.356, 0.0, 1.571, 0.785],   # 04. 右偏 23度
+    [0.8, -0.600, 0.3, -2.100, 0.1, 1.600, 0.800],   # 05. 右深处
+    [0.6, -0.850, 0.1, -2.400, 0.0, 1.550, 0.750],   # 06. 右中距离
+    [-0.4, -0.785, -0.2, -2.356, 0.0, 1.571, 0.785], # 07. 左偏 23度
+    [-0.8, -0.600, -0.3, -2.100, -0.1, 1.600, 0.800],# 08. 左深处
+    [-0.6, -0.850, -0.1, -2.400, 0.0, 1.550, 0.750], # 09. 左中距离
+    [0.0, -0.200, 0.0, -1.500, 0.0, 1.300, 0.785],   # 10. 高位中心
+    [0.5, -0.200, 0.1, -1.600, 0.0, 1.400, 0.785],   # 11. 高位右视
+    [-0.5, -0.200, -0.1, -1.600, 0.0, 1.400, 0.785], # 12. 高位左视
+    [0.0, -1.200, 0.0, -2.800, 0.0, 1.800, 0.785],   # 13. 中心压低
+    [0.3, -1.150, 0.1, -2.700, 0.0, 1.750, 0.785],   # 14. 右侧压低
+    [-0.3, -1.150, -0.1, -2.700, 0.0, 1.750, 0.785], # 15. 左侧压低
+    [0.0, -0.785, 0.0, -2.356, 0.5, 1.571, 1.200],   # 16. 手腕右旋
+    [0.0, -0.785, 0.0, -2.356, -0.5, 1.571, 0.400],  # 17. 手腕左旋
+    [0.0, -0.500, 0.0, -1.800, 0.0, 1.900, 0.785],   # 18. 中心前伸
+    [0.2, -0.400, 0.0, -1.700, 0.0, 2.000, 0.785],   # 19. 右前斜伸
+    [-0.2, -0.400, 0.0, -1.700, 0.0, 2.000, 0.785],  # 20. 左前斜伸
+]
+
+# 扰动参数
+PERTURBATION_SCALE = 0.15  # 扰动幅度（弧度），约8.6度
+
 # ===================== 辅助类 =====================
 class ViewportCamera:
     def __init__(self, camera_path, resolution=(1280, 720)):
@@ -334,94 +363,75 @@ def compute_marker_geometry(marker_world_pos, camera_world_pos, camera_quat, cam
 
 def sample_valid_initial_config(robot, sim, max_attempts=100):
     """
-    使用拒绝采样找到工作空间内的有效初始配置
+    ✅ 改进版本：使用 Neutral Poses + 小扰动
+    
+    替代原来的拒绝采样方法。优点：
+    - 避免奇怪的、不自然的姿态
+    - 确保数据在合理的工作空间范围内
+    - 更快收敛（不需要反复拒绝采样）
+    
+    流程：
+    1. 随机选择一个 neutral pose
+    2. 添加小扰动（每个关节 ±0.15rad，约 ±8.6度）
+    3. 在关节限位内截断扰动后的配置
+    4. 验证末端执行器是否在工作空间内
+    5. 如果不在，重试（最多100次）
+    
     返回: (joint_positions, ee_pos_base) 或 (None, None) 如果失败
     """
-    # 获取 Panda base 的世界变换
-    base_quat = None
-    base_pos = None
-    
-    try:
-        base_prim = XFormPrim("/World/Panda")
-        base_world_pos, base_world_orn = base_prim.get_world_pose()
-        
-        # 确保转换为 Python float（Gf 需要 double 类型）
-        base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
-        base_orn = [float(base_world_orn[0]), float(base_world_orn[1]), float(base_world_orn[2]), float(base_world_orn[3])]
-        
-        # 使用 Gf 库处理四元数和旋转
-        # base_orn 是 (w, x, y, z) 格式
-        # base_quat: Gf.Quatd(w, Vec3d(x,y,z))
-        base_quat = Gf.Quatd(float(base_orn[0]), Gf.Vec3d(float(base_orn[1]), float(base_orn[2]), float(base_orn[3])))
-        
-    except Exception as e:
-        print(f"⚠️ 无法获取base变换: {e}，使用简化方法（仅平移）")
-        # 简化方法：只考虑平移（转换为 float 避免类型错误）
-        try:
-            base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
-        except:
-            # 如果 base_world_pos 也不存在，使用默认值
-            base_pos = [0.0, 0.0, 0.0]
-        base_quat = None
-    
-    # 构建从world到base的变换
-    # p_base = q_inv * (p_world - t) * q_inv_conj 这种思想
-    # 使用 Gf.Quatd 的 Transform 方法
-    def world_to_base(p_world):
-        # p_rel = p_world - base_pos
-        p_world = np.array([float(p_world[0]), float(p_world[1]), float(p_world[2])], dtype=float)
-        p_rel = Gf.Vec3d(p_world[0] - float(base_pos[0]),
-                         p_world[1] - float(base_pos[1]),
-                         p_world[2] - float(base_pos[2]))
-        
-        # 如果拿不到旋转，就退化为仅平移
-        if base_quat is None:
-            return np.array([float(p_rel[0]), float(p_rel[1]), float(p_rel[2])], dtype=float)
-        
-        # world -> base: 乘以 base 的逆旋转
-        q_inv = base_quat.GetInverse()
-        
-        # ✅ 关键：用四元数旋转向量（Gf 支持 Transform）
-        p_base = q_inv.Transform(p_rel)
-        
-        return np.array([float(p_base[0]), float(p_base[1]), float(p_base[2])], dtype=float)
-    
     num_joints = robot.num_dof
     
     for attempt in range(max_attempts):
-        # 1. 随机采样关节配置
-        joint_positions = sample_random_joint_config(num_joints)
+        # 1. 随机选择一个 neutral pose
+        base_pose = np.array(NEUTRAL_POSES[np.random.randint(0, len(NEUTRAL_POSES))], dtype=np.float32)
         
-        # 2. 设置关节位置（先重置速度，避免突然变化）
+        # 2. 添加小扰动（每个关节独立扰动）
+        perturbation = np.random.uniform(-PERTURBATION_SCALE, PERTURBATION_SCALE, size=num_joints)
+        perturbed_pose = base_pose + perturbation
+        
+        # 3. 在关节限位内截断
+        joint_positions = np.zeros(num_joints, dtype=np.float32)
+        for i in range(num_joints):
+            if i < len(PANDA_JOINT_LIMITS):
+                lower, upper = PANDA_JOINT_LIMITS[i]
+                joint_positions[i] = np.clip(perturbed_pose[i], lower, upper)
+            else:
+                joint_positions[i] = perturbed_pose[i]
+        
+        # 4. 应用到机器人并让物理稳定
         robot.set_joint_velocities(np.zeros(num_joints))
         robot.set_joint_positions(joint_positions)
         
-        # 3. 推进更多帧让物理稳定（减少 PhysX 警告）
-        for _ in range(10):  # 从10帧增加到20帧
+        # 推进几帧让物理引擎处理
+        for _ in range(10):
             sim.step(render=False)
         
-        # 4. 获取TCP的世界坐标（使用真实路径 /World/Panda/TCP）
+        # 5. 获取末端执行器的世界坐标
         try:
             tcp_prim = XFormPrim("/World/Panda/TCP")
             tcp_world_pos, _ = tcp_prim.get_world_pose()
+            
+            # 转换到 base 坐标系（简化：仅考虑平移）
+            # 因为 base 通常在原点，所以 tcp_base ≈ tcp_world
+            tcp_base_pos = np.array([float(tcp_world_pos[0]), float(tcp_world_pos[1]), float(tcp_world_pos[2])])
         except Exception as e:
-            # 如果TCP获取失败，跳过这次尝试
+            # 如果获取失败，跳过这次尝试
+            if attempt < 5:
+                print(f"   ⏳ 尝试 {attempt+1}/{max_attempts}: 无法获取TCP位置，重试...")
             continue
-        
-        # 5. 转换到base坐标系
-        tcp_base_pos = world_to_base(tcp_world_pos)
         
         # 6. 检查工作空间约束
         is_valid, reason = check_workspace_constraint(tcp_base_pos)
         
         if is_valid:
-            print(f"   ✅ 找到有效配置 (尝试 {attempt+1} 次): TCP_base=({tcp_base_pos[0]:.3f}, {tcp_base_pos[1]:.3f}, {tcp_base_pos[2]:.3f})")
+            if attempt > 0:
+                print(f"   ✅ 找到有效配置 (尝试 {attempt+1} 次): TCP_base=({tcp_base_pos[0]:.3f}, {tcp_base_pos[1]:.3f}, {tcp_base_pos[2]:.3f})")
             return joint_positions, tcp_base_pos
         else:
-            if attempt < 5 or attempt % 20 == 0:  # 只打印前几次和每20次
+            if attempt < 5 or attempt % 20 == 0:
                 print(f"   ⏳ 尝试 {attempt+1}/{max_attempts}: {reason}")
     
-    print(f"   ❌ 在 {max_attempts} 次尝试后未找到有效配置")
+    print(f"   ❌ 在 {max_attempts} 次尝试后未找到有效配置（所有neutral pose都不在工作空间内）")
     return None, None
 
 # ===================== 主函数 =====================
@@ -580,23 +590,21 @@ def main():
             print(f"   ⚠️ 无法获取marker位置: {e}，使用默认位置")
             marker_world_pos = None
 
-        print(f"   🎲 使用拒绝采样寻找工作空间内的初始配置...")
+        # ✅ 改进：使用 Neutral Poses + 小扰动，而不是完全随机拒绝采样
+        print(f"   🎲 从 {len(NEUTRAL_POSES)} 个预定义姿态中随机选择，添加小扰动({PERTURBATION_SCALE:.2f}rad)...")
         print(f"      工作空间: 中心={WORKSPACE_CENTER}, 半径={WORKSPACE_RADIUS}m, Z范围=[{WORKSPACE_Z_MIN}, {WORKSPACE_Z_MAX}]m")
 
-        if marker_world_pos is not None:
-            random_joint_positions, ee_pos_base = sample_valid_initial_config(robot, sim, max_attempts=100)
-            config_type = "rejection_sampling"
-        else:
-            random_joint_positions = sample_random_joint_config(robot.num_dof)
-            robot.set_joint_positions(random_joint_positions)
-            config_type = "fallback"
-
+        # 尝试找到有效配置（最多100次尝试）
+        random_joint_positions, ee_pos_base = sample_valid_initial_config(robot, sim, max_attempts=100)
+        
         if random_joint_positions is None:
-            print(f"   ⚠️ 无法找到有效配置，使用随机配置（可能不在工作空间内）")
-            random_joint_positions = sample_random_joint_config(robot.num_dof)
+            # 如果找不到有效配置，使用第一个 neutral pose（保证至少有一个合理的起始点）
+            print(f"   ⚠️ 无法找到在工作空间内的配置，使用第一个 neutral pose 作为后备")
+            random_joint_positions = np.array(NEUTRAL_POSES[0], dtype=np.float32)
             robot.set_joint_positions(random_joint_positions)
-            config_type = "fallback"
+            config_type = "neutral_pose_default"
         else:
+            config_type = "neutral_pose_perturbed"
             robot.set_joint_positions(random_joint_positions)
 
         print(f"   📍 初始关节配置类型: {config_type}")
