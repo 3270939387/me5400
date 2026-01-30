@@ -171,27 +171,6 @@ def sample_random_joint_config(num_joints, base_config=None, variation_scale=1.0
                 random_joint_positions.append(np.random.uniform(-np.pi, np.pi))
         return np.array(random_joint_positions, dtype=np.float32)
 
-def check_workspace_constraint(ee_pos_base):
-    """
-    检查末端执行器位置是否在工作空间内
-    ee_pos_base: 末端执行器在 Panda base 坐标系下的位置 (x, y, z)
-    返回: (is_valid, reason)
-    """
-    # 1. 检查球约束：||p_ee - center|| <= radius
-    offset = ee_pos_base - WORKSPACE_CENTER
-    distance = np.linalg.norm(offset)
-    if distance > WORKSPACE_RADIUS:
-        return False, f"超出球半径: {distance:.3f}m > {WORKSPACE_RADIUS}m"
-    
-    # 2. 检查Z范围约束：z_min <= z <= z_max
-    z = ee_pos_base[2]
-    if z < WORKSPACE_Z_MIN:
-        return False, f"Z过低: {z:.3f}m < {WORKSPACE_Z_MIN}m"
-    if z > WORKSPACE_Z_MAX:
-        return False, f"Z过高: {z:.3f}m > {WORKSPACE_Z_MAX}m"
-    
-    return True, "OK"
-
 def compute_marker_geometry(marker_world_pos, camera_world_pos, camera_quat, camera_intrinsics, img_resolution):
     """
     计算marker在相机图像坐标系中的几何信息 (u, v, s)
@@ -363,19 +342,15 @@ def compute_marker_geometry(marker_world_pos, camera_world_pos, camera_quat, cam
 
 def sample_valid_initial_config(robot, sim, max_attempts=100):
     """
-    ✅ 改进版本：使用 Neutral Poses + 小扰动
+    ✅ 简化版本：使用 Neutral Poses + 小扰动
     
-    替代原来的拒绝采样方法。优点：
-    - 避免奇怪的、不自然的姿态
-    - 确保数据在合理的工作空间范围内
-    - 更快收敛（不需要反复拒绝采样）
+    由于 neutral poses 都是预定义的合理姿态，不需要复杂的工作空间检查
+    只需要确保：
+    1. 添加小扰动
+    2. 在关节限位内截断
+    3. 让物理引擎处理
     
-    流程：
-    1. 随机选择一个 neutral pose
-    2. 添加小扰动（每个关节 ±0.15rad，约 ±8.6度）
-    3. 在关节限位内截断扰动后的配置
-    4. 验证末端执行器是否在工作空间内
-    5. 如果不在，重试（最多100次）
+    最多尝试 max_attempts 次（处理偶发的物理失败）
     
     返回: (joint_positions, ee_pos_base) 或 (None, None) 如果失败
     """
@@ -406,32 +381,24 @@ def sample_valid_initial_config(robot, sim, max_attempts=100):
         for _ in range(10):
             sim.step(render=False)
         
-        # 5. 获取末端执行器的世界坐标
+        # 5. 获取末端执行器的世界坐标（仅用于验证，不做约束检查）
         try:
             tcp_prim = XFormPrim("/World/Panda/TCP")
             tcp_world_pos, _ = tcp_prim.get_world_pose()
-            
-            # 转换到 base 坐标系（简化：仅考虑平移）
-            # 因为 base 通常在原点，所以 tcp_base ≈ tcp_world
             tcp_base_pos = np.array([float(tcp_world_pos[0]), float(tcp_world_pos[1]), float(tcp_world_pos[2])])
+            
+            # ✅ 直接返回（不需要工作空间检查，neutral pose已经验证过）
+            if attempt > 0:
+                print(f"   ✅ 找到有效配置 (尝试 {attempt+1} 次): TCP=({tcp_base_pos[0]:.3f}, {tcp_base_pos[1]:.3f}, {tcp_base_pos[2]:.3f})")
+            return joint_positions, tcp_base_pos
+            
         except Exception as e:
-            # 如果获取失败，跳过这次尝试
-            if attempt < 5:
+            # 如果获取失败，重试
+            if attempt < 5 or attempt % 20 == 0:
                 print(f"   ⏳ 尝试 {attempt+1}/{max_attempts}: 无法获取TCP位置，重试...")
             continue
-        
-        # 6. 检查工作空间约束
-        is_valid, reason = check_workspace_constraint(tcp_base_pos)
-        
-        if is_valid:
-            if attempt > 0:
-                print(f"   ✅ 找到有效配置 (尝试 {attempt+1} 次): TCP_base=({tcp_base_pos[0]:.3f}, {tcp_base_pos[1]:.3f}, {tcp_base_pos[2]:.3f})")
-            return joint_positions, tcp_base_pos
-        else:
-            if attempt < 5 or attempt % 20 == 0:
-                print(f"   ⏳ 尝试 {attempt+1}/{max_attempts}: {reason}")
     
-    print(f"   ❌ 在 {max_attempts} 次尝试后未找到有效配置（所有neutral pose都不在工作空间内）")
+    print(f"   ❌ 在 {max_attempts} 次尝试后仍无法获取TCP位置")
     return None, None
 
 # ===================== 主函数 =====================
