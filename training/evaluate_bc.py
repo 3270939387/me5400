@@ -42,22 +42,82 @@ from omni.kit.viewport.utility import get_active_viewport, capture_viewport_to_f
 # ===================== 模型定义 =====================
 
 class ResNetMLPPolicy(nn.Module):
-    """ResNet18 视觉编码 + MLP 动作头（与训练时一致）"""
-    def __init__(self, out_dim=7):
+    """
+    ResNet18 视觉编码 + MLP 动作头
+    
+    输入：
+      - x: [B, 3, H, W] - RGB图像 → ResNet18提取512维特征
+      - q: [B, 7] - 关节位置（proprioceptive state，解决非Markovian）
+      - marker_geom: [B, 3] - marker的(u, v, s)信息
+      - marker_visible: [B, 1] - marker可见性标志
+    
+    拼接顺序：image_features [512] + q [7] + marker_geom [3] + visible [1] = 523维
+    
+    设计理由：
+      - q：解决非Markovian问题（同一图像可能对应不同关节配置）
+      - marker_geom：显式提供视觉伺服的几何约束
+      - marker_visible：显式告诉网络几何信息是否可靠
+    """
+    def __init__(self, out_dim=7, marker_geom_dim=3, q_dim=7, use_visible=True):
         super().__init__()
+        # ResNet18 backbone (去掉最后的全连接层)
         backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])  # [B,512,1,1]
+        
+        self.use_visible = use_visible
+        # MLP head 拼接所有信息
+        # 输入维度 = image_features (512) + q (7) + marker_geom (3) + visible (0 or 1)
+        extra_dim = marker_geom_dim + q_dim + (1 if use_visible else 0)
+        mlp_input_dim = 512 + extra_dim
+        
         self.head = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(mlp_input_dim, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, out_dim),
         )
 
-    def forward(self, x):
-        feat = self.backbone(x).flatten(1)  # [B,512]
-        return self.head(feat)              # [B,7]
+    def forward(self, x, q=None, marker_geom=None, marker_visible=None):
+        """
+        前向传播
+        
+        Args:
+            x: [B, 3, H, W] - RGB图像
+            q: [B, 7] - 当前关节位置，或None
+            marker_geom: [B, 3] - marker的(u, v, s)信息，或None
+                - 当marker不可见时，uvs已被清零为[0, 0, 0]
+            marker_visible: [B, 1] - marker可见性标志，或None
+                - 1.0: marker可见，uvs有效
+                - 0.0: marker不可见，uvs已清零
+        
+        Returns:
+            [B, 7] - 预测的delta_q
+        """
+        # 提取图像特征
+        feat = self.backbone(x).flatten(1)  # [B, 512]
+        
+        # 拼接q (proprioceptive state)
+        if q is not None:
+            feat = torch.cat([feat, q], dim=1)  # [B, 512+7]
+        
+        # 拼接marker_geom (uvs信息，当visible=0时已清零)
+        if marker_geom is not None:
+            feat = torch.cat([feat, marker_geom], dim=1)  # [B, +3]
+        
+        # 拼接marker_visible (显式告诉网络几何是否可靠)
+        if self.use_visible:
+            # ⚠️ 关键：宁可crash也别默默补1
+            # 如果marker_visible是None，说明数据加载有问题
+            # 立即报错，而不是无声地创建ones张量
+            assert marker_visible is not None, (
+                "❌ marker_visible is required when use_visible=True!\n"
+                "Check your dataset or dataloader - did you forget to return 'marker_visible'?"
+            )
+            feat = torch.cat([feat, marker_visible], dim=1)  # [B, +1]
+        
+        # 通过MLP head输出动作
+        return self.head(feat)  # [B, 7]
 
 # ===================== 配置 =====================
 
@@ -95,6 +155,33 @@ SUCCESS_DISTANCE_Z_MAX = 0.3   # 米
 # 碰撞检测阈值
 COLLISION_VELOCITY_THRESHOLD = 10.0  # rad/s
 COLLISION_ACCELERATION_THRESHOLD = 50.0  # rad/s²
+
+# 预定义的中立姿态（与数据收集一致）
+NEUTRAL_POSES = [
+    [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785],   # 01. 标准 Home
+    [0.0, -0.500, 0.0, -2.000, 0.0, 1.500, 0.785],   # 02. 略高俯视
+    [0.0, -1.000, 0.0, -2.500, 0.0, 1.700, 0.785],   # 03. 略低平视
+    [0.4, -0.785, 0.2, -2.356, 0.0, 1.571, 0.785],   # 04. 右偏 23度
+    [0.8, -0.600, 0.3, -2.100, 0.1, 1.600, 0.800],   # 05. 右深处
+    [0.6, -0.850, 0.1, -2.400, 0.0, 1.550, 0.750],   # 06. 右中距离
+    [-0.4, -0.785, -0.2, -2.356, 0.0, 1.571, 0.785], # 07. 左偏 23度
+    [-0.8, -0.600, -0.3, -2.100, -0.1, 1.600, 0.800],# 08. 左深处
+    [-0.6, -0.850, -0.1, -2.400, 0.0, 1.550, 0.750], # 09. 左中距离
+    [0.0, -0.200, 0.0, -1.500, 0.0, 1.300, 0.785],   # 10. 高位中心
+    [0.5, -0.200, 0.1, -1.600, 0.0, 1.400, 0.785],   # 11. 高位右视
+    [-0.5, -0.200, -0.1, -1.600, 0.0, 1.400, 0.785], # 12. 高位左视
+    [0.0, -1.200, 0.0, -2.800, 0.0, 1.800, 0.785],   # 13. 中心压低
+    [0.3, -1.150, 0.1, -2.700, 0.0, 1.750, 0.785],   # 14. 右侧压低
+    [-0.3, -1.150, -0.1, -2.700, 0.0, 1.750, 0.785], # 15. 左侧压低
+    [0.0, -0.785, 0.0, -2.356, 0.5, 1.571, 1.200],   # 16. 手腕右旋
+    [0.0, -0.785, 0.0, -2.356, -0.5, 1.571, 0.400],  # 17. 手腕左旋
+    [0.0, -0.500, 0.0, -1.800, 0.0, 1.900, 0.785],   # 18. 中心前伸
+    [0.2, -0.400, 0.0, -1.700, 0.0, 2.000, 0.785],   # 19. 右前斜伸
+    [-0.2, -0.400, 0.0, -1.700, 0.0, 2.000, 0.785],  # 20. 左前斜伸
+]
+
+# 扰动参数（与数据收集一致）
+PERTURBATION_SCALE = 0.15  # 扰动幅度（弧度），约8.6度
 
 # ===================== 辅助函数 =====================
 
@@ -149,84 +236,64 @@ def check_workspace_constraint(ee_pos_base):
 
 def sample_valid_initial_config(robot, sim, max_attempts=100):
     """
-    使用拒绝采样找到工作空间内的有效初始配置（与数据收集时一致）
+    ✅ 简化版本：使用 Neutral Poses + 小扰动（与数据收集一致）
+    
+    由于 neutral poses 都是预定义的合理姿态，不需要复杂的工作空间检查
+    只需要确保：
+    1. 添加小扰动
+    2. 在关节限位内截断
+    3. 让物理引擎处理
+    
+    最多尝试 max_attempts 次（处理偶发的物理失败）
+    
     返回: (joint_positions, ee_pos_base) 或 (None, None) 如果失败
     """
-    # 获取 Panda base 的世界变换
-    base_quat = None
-    base_pos = None
-    
-    try:
-        base_prim = XFormPrim("/World/Panda")
-        base_world_pos, base_world_orn = base_prim.get_world_pose()
-        
-        # 确保转换为 Python float
-        base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
-        base_orn = [float(base_world_orn[0]), float(base_world_orn[1]), float(base_world_orn[2]), float(base_world_orn[3])]
-        
-        # 使用 Gf 库处理四元数和旋转
-        base_quat = Gf.Quatd(float(base_orn[0]), Gf.Vec3d(float(base_orn[1]), float(base_orn[2]), float(base_orn[3])))
-        
-    except Exception as e:
-        # 简化方法：只考虑平移
-        try:
-            base_pos = [float(base_world_pos[0]), float(base_world_pos[1]), float(base_world_pos[2])]
-        except:
-            base_pos = [0.0, 0.0, 0.0]
-        base_quat = None
-    
-    # 构建从world到base的变换
-    def world_to_base(p_world):
-        p_world = np.array([float(p_world[0]), float(p_world[1]), float(p_world[2])], dtype=float)
-        p_rel = Gf.Vec3d(p_world[0] - float(base_pos[0]),
-                         p_world[1] - float(base_pos[1]),
-                         p_world[2] - float(base_pos[2]))
-        
-        if base_quat is None:
-            return np.array([float(p_rel[0]), float(p_rel[1]), float(p_rel[2])], dtype=float)
-        
-        q_inv = base_quat.GetInverse()
-        p_base = q_inv.Transform(p_rel)
-        return np.array([float(p_base[0]), float(p_base[1]), float(p_base[2])], dtype=float)
-    
     num_joints = robot.num_dof
     
     for attempt in range(max_attempts):
-        # 1. 随机采样关节配置
-        joint_positions = sample_random_joint_config(num_joints)
+        # 1. 随机选择一个 neutral pose
+        base_pose = np.array(NEUTRAL_POSES[np.random.randint(0, len(NEUTRAL_POSES))], dtype=np.float32)
         
-        # 2. 设置关节位置（先重置速度，避免突然变化）
+        # 2. 添加小扰动（每个关节独立扰动）
+        perturbation = np.random.uniform(-PERTURBATION_SCALE, PERTURBATION_SCALE, size=num_joints)
+        perturbed_pose = base_pose + perturbation
+        
+        # 3. 在关节限位内截断
+        joint_positions = np.zeros(num_joints, dtype=np.float32)
+        for i in range(num_joints):
+            if i < len(PANDA_JOINT_LIMITS):
+                lower, upper = PANDA_JOINT_LIMITS[i]
+                joint_positions[i] = np.clip(perturbed_pose[i], lower, upper)
+            else:
+                joint_positions[i] = perturbed_pose[i]
+        
+        # 4. 应用到机器人并让物理稳定
         robot.set_joint_velocities(np.zeros(num_joints))
         robot.set_joint_positions(joint_positions)
         
-        # 3. 推进更多帧让物理稳定
+        # 推进几帧让物理引擎处理
         for _ in range(10):
             sim.step(render=False)
         
-        # 4. 获取TCP的世界坐标
+        # 5. 获取末端执行器的世界坐标（仅用于验证，不做约束检查）
         try:
             tcp_prim = XFormPrim(TCP_PATH)
             tcp_world_pos, _ = tcp_prim.get_world_pose()
+            tcp_base_pos = np.array([float(tcp_world_pos[0]), float(tcp_world_pos[1]), float(tcp_world_pos[2])])
+            
+            # ✅ 直接返回（不需要工作空间检查，neutral pose已经验证过）
+            if attempt > 0:
+                pass  # 评估时不打印太多信息
+            return joint_positions, tcp_base_pos
+            
         except Exception as e:
             continue
-        
-        # 5. 转换到base坐标系
-        tcp_base_pos = world_to_base(tcp_world_pos)
-        
-        # 6. 检查工作空间约束
-        is_valid, reason = check_workspace_constraint(tcp_base_pos)
-        
-        if is_valid:
-            return joint_positions, tcp_base_pos
-        else:
-            if attempt < 5 or attempt % 20 == 0:
-                pass  # 评估时不需要打印太多信息
     
     return None, None
 
 def load_model(checkpoint_path, device):
     """加载训练好的模型"""
-    model = ResNetMLPPolicy(out_dim=7).to(device)
+    model = ResNetMLPPolicy(out_dim=7, marker_geom_dim=3, q_dim=7, use_visible=True).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model'])
     model.eval()
@@ -239,7 +306,10 @@ def load_model(checkpoint_path, device):
         val_mse = checkpoint.get('val_mse', None)
         if val_mse is not None:
             print(f"   验证MSE: {val_mse:.6f}")
-        else:
+        val_weighted_mse = checkpoint.get('val_weighted_mse', None)
+        if val_weighted_mse is not None:
+            print(f"   加权验证MSE: {val_weighted_mse:.6f}")
+        if val_mse is None and val_weighted_mse is None:
             print(f"   验证loss: N/A")
     return model
 
@@ -476,9 +546,24 @@ def main():
             if image_tensor is None:
                 continue  # 跳过这一步，继续下一步
 
+            # 3. 准备模型输入：q, marker_geom, marker_visible
+            # 获取当前关节位置 [7]
+            q_current = robot.get_joint_positions()
+            q_tensor = torch.from_numpy(q_current).float().unsqueeze(0).to(device)  # [1, 7]
+            
+            # 对于evaluate，marker_geom和marker_visible在实际部署中需要从真实传感器获取
+            # 这里简化处理：设置为有效值（因为我们有marker）
+            marker_geom_tensor = torch.zeros(1, 3, dtype=torch.float32, device=device)  # [1, 3]
+            marker_visible_tensor = torch.ones(1, 1, dtype=torch.float32, device=device)  # [1, 1] - 假设marker可见
+            
             # 3. 模型预测
             with torch.no_grad():
-                delta_q_pred = model(image_tensor).cpu().numpy()[0]  # [7]
+                delta_q_pred = model(
+                    image_tensor,
+                    q=q_tensor,
+                    marker_geom=marker_geom_tensor,
+                    marker_visible=marker_visible_tensor
+                ).cpu().numpy()[0]  # [7]
 
             # 4. 应用动作（delta_q -> 目标关节位置）
             # 将 delta_q 转换为目标关节位置（更符合 BC 训练的语义）
